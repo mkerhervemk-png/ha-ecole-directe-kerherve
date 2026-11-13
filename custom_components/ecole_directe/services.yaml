@@ -1,0 +1,43 @@
+# yaml-language-server: $schema=../../schemas/yaml/services_schema.yaml
+# Describes the format for available services for ecole_directe
+
+# Service ID
+devoir_effectue:
+  # Different fields that your service action accepts
+  fields:
+    # Key of the field
+    eleve_id:
+      # Whether or not field is required (default = false)
+      required: true
+      # Advanced fields are only shown when the advanced mode is enabled for the user
+      # (default = false)
+      advanced: false
+      # Example value that can be passed for this field
+      example: "2021"
+      # The default field value
+      default: "0"
+    devoir_id:
+      # Whether or not field is required (default = false)
+      required: true
+      # Advanced fields are only shown when the advanced mode is enabled for the user
+      # (default = false)
+      advanced: false
+      # Example value that can be passed for this field
+      example: "2021"
+      # The default field value
+      default: "0"
+    effectue:
+      # Whether or not field is required (default = false)
+      required: true
+      # Advanced fields are only shown when the advanced mode is enabled for the user
+      # (default = false)
+      advanced: false
+      # Example value that can be passed for this field
+      example: false
+      # The default field value
+      default: true
+      selector:
+        boolean: {}
+reload_data:
+  name: Reload Data
+  description: Force a refresh of the integration data from the API

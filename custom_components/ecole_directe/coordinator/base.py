@@ -1,0 +1,1577 @@
+# Copyright (c) 2024-2026
+# SPDX-License-Identifier: MIT
+
+"""
+Core DataUpdateCoordinator implementation for ecole_directe.
+
+This module contains the main coordinator class that manages data fetching
+and updates for all entities in the integration. It handles refresh cycles,
+error handling, and triggers reauthentication when needed.
+
+For more information on coordinators:
+https://developers.home-assistant.io/docs/integration_fetching_data#coordinated-single-api-poll-for-data-for-all-entities
+"""
+
+from __future__ import annotations
+
+import asyncio
+import functools
+import json
+from contextlib import asynccontextmanager
+from datetime import date, datetime, timedelta, tzinfo
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+import anyio
+from ecoledirecte_api.client import QCMException
+from homeassistant.core import Event, callback
+from homeassistant.exceptions import ConfigEntryAuthFailed
+from homeassistant.helpers.storage import Store
+from homeassistant.helpers.update_coordinator import (
+    TimestampDataUpdateCoordinator,
+    UpdateFailed,
+)
+from homeassistant.util import dt as dt_util
+
+from custom_components.ecole_directe.api import (
+    EDApiClientAuthenticationError,
+    EDApiClientError,
+)
+from custom_components.ecole_directe.api.client import (
+    EDApiClient,
+)
+from custom_components.ecole_directe.const import (
+    AUGUST,
+    DEFAULT_LUNCH_BREAK_TIME,
+    DOMAIN,
+    EVENT_TYPE,
+    FAKE_ON,
+    FILENAME_QCM,
+    FORCED_MODULES,
+    GRADES_TO_DISPLAY,
+    INTEGRATION_PATH,
+    LOGGER,
+    MAX_DOCUMENT_CACHE_BYTES,
+    MAX_QUESTIONS,
+)
+from custom_components.ecole_directe.helpers import get_unique_id
+
+from . import extras
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
+    from logging import Logger
+
+    from homeassistant.core import HomeAssistant
+
+    from custom_components.ecole_directe.api.client import (
+        EDEleve,
+        EDWorkspaceActivity,
+        EDWorkspacePostit,
+    )
+    from custom_components.ecole_directe.data import EDConfigEntry
+
+
+class EDDataUpdateCoordinator(TimestampDataUpdateCoordinator):
+    """
+    Class to manage fetching data from the API.
+
+    This coordinator handles all data fetching for the integration and distributes
+    updates to all entities. It manages:
+    - Periodic data updates based on update_interval
+    - Error handling and recovery
+    - Authentication failure detection and reauthentication triggers
+    - Data distribution to all entities
+    - Context-based data fetching (only fetch data for active entities)
+
+    For more information:
+    https://developers.home-assistant.io/docs/integration_fetching_data#coordinated-single-api-poll-for-data-for-all-entities
+
+    Attributes:
+        config_entry: The config entry for this integration instance.
+
+    """
+
+    config_entry: EDConfigEntry
+    timezone: tzinfo
+
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        entry: EDConfigEntry,
+        logger: Logger,
+        name: str,
+        update_interval: timedelta,
+    ) -> None:
+        """Initialize the coordinator."""
+        super().__init__(
+            hass=hass,
+            logger=logger,
+            name=name,
+            config_entry=entry,
+            update_interval=update_interval,
+            always_update=False,
+        )
+        self.timezone = dt_util.get_default_time_zone()
+        LOGGER.debug("timezone: %s", self.timezone)
+        # Initialize QCM data store for persistence
+        self._qcm_store = Store(hass, 1, f"ecole_directe_qcm_{entry.entry_id}")
+        # Initialize attributes store for oversized attributes persistence
+        self._attributes_store = Store(hass, 1, f"ed_attributes_{entry.entry_id}")
+        self._stored_attributes: dict[str, Any] = {}
+        # Trusted device (cn/cv) returned by Ecole Directe after the QCM,
+        # persisted with the QCM data so that the next logins skip the QCM.
+        self._trusted_device: dict[str, str] | None = None
+        # Local cache of downloaded homework documents: Ecole Directe has no
+        # server-side Range support, so without a cache every seek/replay in
+        # the devoirs card would re-download the whole file. Stored next to
+        # logs/test fixtures (see EDApiClient), lost (harmlessly) on update.
+        self._document_cache_dir = Path(
+            hass.config.config_dir + INTEGRATION_PATH + "documents/"
+        )
+        self._document_download_locks: dict[str, asyncio.Lock] = {}
+
+    async def _async_setup(self) -> None:
+        """
+        Set up the coordinator.
+
+        This method is called automatically during async_config_entry_first_refresh()
+        and is the ideal place for one-time initialization tasks such as:
+        - Loading device information
+        - Setting up event listeners
+        - Initializing caches
+
+        This runs before the first data fetch, ensuring any required setup
+        is complete before entities start requesting data.
+
+        Example: Fetch device info once at startup
+        device_info = await self.config_entry.runtime_data.client.get_device_info()
+        self._device_id = device_info["id"]
+        """
+        self.data = {
+            "qcm_questions": {},
+            "qcm_selected_options": {},
+        }
+
+        # Load saved QCM data from disk
+        saved_qcm = await self._qcm_store.async_load()
+        if isinstance(saved_qcm, dict):
+            self.data["qcm_questions"] = saved_qcm.get("qcm_questions", {})
+            self.data["qcm_selected_options"] = saved_qcm.get(
+                "qcm_selected_options", {}
+            )
+            trusted_device = saved_qcm.get("trusted_device")
+            if (
+                isinstance(trusted_device, dict)
+                and trusted_device.get("cn")
+                and trusted_device.get("cv")
+            ):
+                self._trusted_device = trusted_device
+            LOGGER.debug("Loaded saved QCM data: %s", saved_qcm)
+
+        # Load saved attributes data from disk
+        saved_attributes = await self._attributes_store.async_load()
+        if isinstance(saved_attributes, dict):
+            self._stored_attributes = saved_attributes
+            LOGGER.debug(
+                "Loaded saved attributes data for %s keys", len(self._stored_attributes)
+            )
+
+        # Check for legacy ecoledirecte_qcm.json file, migrate and delete it
+        await self.async_migrate_legacy_qcm_file()
+
+        # Create the document cache dir and clear any unfinished downloads
+        # left over from a crash/restart. Filesystem access, so off the loop.
+        await self.hass.async_add_executor_job(self._init_document_cache_dir)
+
+        LOGGER.debug("Coordinator setup complete for %s", self.config_entry.entry_id)
+
+        @callback
+        def _handle_new_qcm_event(event: Event) -> None:
+            if event.data.get("type") != "new_qcm":
+                return
+
+            qcm_json = event.data.get("qcm_json", {})
+            self.hass.async_create_task(self._async_handle_new_qcm_event(qcm_json))
+
+        self.config_entry.async_on_unload(
+            self.hass.bus.async_listen(EVENT_TYPE, _handle_new_qcm_event)
+        )
+
+    async def _async_handle_new_qcm_event(self, qcm_json: dict[str, list[str]]) -> None:
+        """Handle incoming QCM events and update stored questions."""
+        LOGGER.debug("Handling new QCM event with data: %s", qcm_json)
+        self._update_qcm_data(qcm_json)
+        self.async_set_updated_data(self.data)
+
+    def _update_qcm_data(self, qcm_json: dict[str, list[str]]) -> None:
+        """Update coordinator data from the latest QCM challenge."""
+        LOGGER.debug("Updating QCM data with new challenge: %s", qcm_json)
+        questions: dict[str, list[str]] = {}
+        for question, propositions in qcm_json.items():
+            if not isinstance(question, str) or not isinstance(propositions, list):
+                continue
+            if len(propositions) < MAX_QUESTIONS:
+                continue
+
+            questions[question] = [str(option) for option in propositions]
+
+        if questions:
+            # Merge new questions with existing ones instead of replacing
+            self.data["qcm_questions"].update(questions)
+            # Preserve all selected options (both old and new)
+            # Only remove answers for questions that no longer exist
+            self.data["qcm_selected_options"] = {
+                question: answer
+                for question, answer in self.data.get(
+                    "qcm_selected_options", {}
+                ).items()
+                if question in self.data["qcm_questions"]
+            }
+        else:
+            self.data["qcm_questions"] = {}
+            self.data["qcm_selected_options"] = {}
+
+        LOGGER.debug("Updated QCM data questions: %s", self.data["qcm_questions"])
+        LOGGER.debug(
+            "Updated QCM data selected options: %s", self.data["qcm_selected_options"]
+        )
+
+        # Persist updated QCM data to disk
+        self.hass.async_create_task(self._async_save_qcm_data())
+
+    def set_qcm_answer(self, question: str, option: str) -> None:
+        """Store the selected QCM answer for the next login attempt."""
+        LOGGER.debug(
+            "Setting QCM answer for question '%s' to option '%s'", question, option
+        )
+        if self.data is None:
+            return
+
+        if question not in self.data.get("qcm_questions", {}):
+            return
+
+        self.data.setdefault("qcm_selected_options", {})[question] = option
+        # Persist QCM data to disk
+        self.hass.async_create_task(self._async_save_qcm_data())
+
+    def _prepare_client(self, client: EDApiClient) -> None:
+        """Give a new client the selected QCM answers and the trusted device."""
+        if self.data is not None:
+            for question, selected_option in self.data.get(
+                "qcm_selected_options", {}
+            ).items():
+                if selected_option is None:
+                    continue
+                client.qcm_json[question] = [selected_option]
+
+        if self._trusted_device is not None:
+            client.cn = self._trusted_device["cn"]
+            client.cv = self._trusted_device["cv"]
+
+    def find_homework_document(self, document_id: str) -> tuple[str, dict] | None:
+        """Find a homework document by id, return the student key and the document."""
+        if not self.data:
+            return None
+        for key, homeworks in self.data.items():
+            if not key.endswith("_homeworks") or not isinstance(homeworks, list):
+                continue
+            for homework in homeworks:
+                for document in homework.get("documents") or []:
+                    if str(document.get("id")) == document_id:
+                        return key.removesuffix("_homeworks"), document
+        return None
+
+    def find_workspace_document(
+        self, workspace_id: str, document_id: str
+    ) -> dict[str, Any] | None:
+        """Find a file added to a workspace cloud activity."""
+        if not self.data:
+            return None
+        activities = self.data.get("wk_activities", {}).get(workspace_id, [])
+        for activity in activities:
+            cloud_details = activity.get("cloud_details")
+            if isinstance(cloud_details, dict):
+                cloud_details = cloud_details.get("data", cloud_details)
+            if isinstance(cloud_details, dict):
+                cloud_details = [cloud_details]
+            if not isinstance(cloud_details, list):
+                continue
+            for detail in cloud_details:
+                if (
+                    isinstance(detail, dict)
+                    and detail.get("action") == "ajoutFichier"
+                    and str(detail.get("id")) == document_id
+                ):
+                    return detail
+        return None
+
+    @asynccontextmanager
+    async def async_logged_in_client(self) -> AsyncIterator[EDApiClient]:
+        """
+        Log in a fresh, short-lived client for an on-demand API call.
+
+        The client stored in self.data["session"] is closed at the end of each
+        refresh: reusing it would silently log in again behind EDApiClient's
+        back (no QCM handling, renewed trusted device lost, stale account
+        switch, session never closed). The client is closed when the caller
+        leaves the context.
+        """
+        async with EDApiClient(
+            self.config_entry.data["username"],
+            self.config_entry.data["password"],
+            self.hass,
+        ) as client:
+            self._prepare_client(client)
+            await client.login()
+            await self._async_remember_trusted_device(client)
+            yield client
+
+    @asynccontextmanager
+    async def async_open_document(
+        self, eleve_key: str, document: dict
+    ) -> AsyncIterator[AsyncIterator[bytes]]:
+        """
+        Log in and open a homework document for streaming.
+
+        The Ecole Directe session stays open until the caller leaves the context,
+        i.e. until the whole document has been streamed.
+        """
+        async with self.async_logged_in_client() as client:
+            eleve = next(
+                (e for e in client.eleves if e.get_fullname_lower() == eleve_key),
+                None,
+            )
+            if eleve is not None and eleve.account_id_login is not None:
+                await client.switch_account(eleve.account_id_login)
+
+            yield client.iter_document(
+                document["id"], document.get("type") or "FICHIER_CDT"
+            )
+
+    def _document_cache_path(self, document_id: Any) -> Path:
+        """Local cache path for a homework document, namespaced per config entry."""
+        return (
+            self._document_cache_dir / f"{self.config_entry.entry_id}_{document_id}.bin"
+        )
+
+    def _init_document_cache_dir(self) -> None:
+        """Create the document cache dir and clear any unfinished downloads."""
+        self._document_cache_dir.mkdir(parents=True, exist_ok=True)
+        for leftover in self._document_cache_dir.glob("*.part"):
+            # Crash/restart recovery: a previous download never finished.
+            leftover.unlink(missing_ok=True)
+
+    def _cached_document_if_valid(self, cache_path: Path, taille: Any) -> Path | None:
+        """Return cache_path if a valid cached copy is already on disk."""
+        if not cache_path.exists():
+            return None
+        if not isinstance(taille, int) or cache_path.stat().st_size == taille:
+            cache_path.touch()  # bump mtime for the LRU eviction below
+            return cache_path
+        LOGGER.warning(
+            "Cached document %s has the wrong size, redownloading", cache_path.name
+        )
+        cache_path.unlink(missing_ok=True)
+        return None
+
+    async def async_get_document_path(self, eleve_key: str, document: dict) -> Path:
+        """
+        Return a local file holding this document's full content.
+
+        Downloads and caches it from Ecole Directe first if it isn't already
+        on disk, so repeated requests (Safari alone issues several Range
+        requests just to start playback) don't each redownload the whole
+        file: Ecole Directe has no server-side Range support of its own.
+        """
+        document_id = document["id"]
+        cache_path = self._document_cache_path(document_id)
+        taille = document.get("taille")
+
+        cached = await self.hass.async_add_executor_job(
+            self._cached_document_if_valid, cache_path, taille
+        )
+        if cached is not None:
+            return cached
+
+        lock = self._document_download_locks.setdefault(
+            str(document_id), asyncio.Lock()
+        )
+        async with lock:
+            try:
+                if await self.hass.async_add_executor_job(cache_path.exists):
+                    # Another request finished downloading while we waited for the lock.
+                    return cache_path
+
+                tmp_path = cache_path.with_suffix(".part")
+                try:
+                    async with (
+                        self.async_open_document(eleve_key, document) as chunks,
+                        await anyio.open_file(tmp_path, "wb") as file,
+                    ):
+                        async for chunk in chunks:
+                            await file.write(chunk)
+                    await self.hass.async_add_executor_job(tmp_path.rename, cache_path)
+                except Exception:
+                    await self.hass.async_add_executor_job(
+                        functools.partial(tmp_path.unlink, missing_ok=True)
+                    )
+                    raise
+
+                await self.hass.async_add_executor_job(
+                    self._evict_document_cache, cache_path
+                )
+                return cache_path
+            finally:
+                self._document_download_locks.pop(str(document_id), None)
+
+    async def async_get_workspace_document_path(
+        self, workspace_id: str, document: dict[str, Any]
+    ) -> Path:
+        """Download and cache a file from a workspace cloud activity."""
+        document_id = str(document["id"])
+        cache_path = self._document_cache_dir / (
+            f"{self.config_entry.entry_id}_workspace_{workspace_id}_{document_id}.bin"
+        )
+        cached = await self.hass.async_add_executor_job(
+            self._cached_document_if_valid, cache_path, None
+        )
+        if cached is not None:
+            return cached
+
+        lock_key = f"workspace_{workspace_id}_{document_id}"
+        lock = self._document_download_locks.setdefault(lock_key, asyncio.Lock())
+        async with lock:
+            try:
+                if await self.hass.async_add_executor_job(cache_path.exists):
+                    return cache_path
+
+                tmp_path = cache_path.with_suffix(".part")
+                try:
+                    async with (
+                        self.async_logged_in_client() as client,
+                        await anyio.open_file(tmp_path, "wb") as file,
+                    ):
+                        async for chunk in client.iter_document(document_id, "CLOUD"):
+                            await file.write(chunk)
+                    await self.hass.async_add_executor_job(tmp_path.rename, cache_path)
+                except Exception:
+                    await self.hass.async_add_executor_job(
+                        functools.partial(tmp_path.unlink, missing_ok=True)
+                    )
+                    raise
+
+                await self.hass.async_add_executor_job(
+                    self._evict_document_cache, cache_path
+                )
+                return cache_path
+            finally:
+                self._document_download_locks.pop(lock_key, None)
+
+    def _evict_document_cache(self, keep: Path) -> None:
+        """Delete the oldest cached documents once the cache exceeds its budget."""
+        try:
+            others = sorted(
+                (p for p in self._document_cache_dir.glob("*.bin") if p != keep),
+                key=lambda p: p.stat().st_mtime,
+            )
+            total = keep.stat().st_size + sum(p.stat().st_size for p in others)
+            for stale in others:
+                if total <= MAX_DOCUMENT_CACHE_BYTES:
+                    break
+                total -= stale.stat().st_size
+                stale.unlink(missing_ok=True)
+        except OSError:
+            LOGGER.exception("Error evicting the document cache")
+
+    async def _async_remember_trusted_device(self, client: EDApiClient) -> None:
+        """Persist the trusted device (cn/cv) when Ecole Directe issued a new one."""
+        if not client.cn or not client.cv:
+            return
+        current = self._trusted_device or {}
+        if current.get("cn") == client.cn and current.get("cv") == client.cv:
+            return
+        self._trusted_device = {
+            "cn": client.cn,
+            "cv": client.cv,
+            "saved_at": datetime.now(self.timezone).isoformat(timespec="seconds"),
+        }
+        await self._async_save_qcm_data()
+        LOGGER.info("Ecole Directe trusted device saved: next logins will skip the QCM")
+
+    async def _async_save_qcm_data(self) -> None:
+        """Save QCM data to disk for persistence."""
+        if self.data is None:
+            return
+
+        qcm_data = {
+            "qcm_questions": self.data.get("qcm_questions", {}),
+            "qcm_selected_options": self.data.get("qcm_selected_options", {}),
+            "trusted_device": self._trusted_device,
+        }
+        await self._qcm_store.async_save(qcm_data)
+        LOGGER.debug("Saved QCM data to store: %s", qcm_data)
+
+    @callback
+    def async_save_attributes(self, key: str, attributes: Any) -> None:
+        """Save oversized attributes to store."""
+        self._stored_attributes[key] = attributes
+        self._attributes_store.async_delay_save(
+            lambda: self._stored_attributes,
+            delay=5,
+        )
+
+    def get_stored_attributes(self, key: str) -> Any | None:
+        """Get stored attributes from store."""
+        return self._stored_attributes.get(key)
+
+    async def async_migrate_legacy_qcm_file(self) -> None:
+        """Check if legacy QCM file exists, read it, convert it to current usage and delete it."""
+        filename = self.config_entry.data.get("qcm_filename", FILENAME_QCM)
+        candidate_paths = [self.hass.config.path(filename)]
+        if filename != FILENAME_QCM:
+            candidate_paths.append(self.hass.config.path(FILENAME_QCM))
+
+        for file_path_str in candidate_paths:
+            file_path = anyio.Path(file_path_str)
+            try:
+                if not await file_path.is_file():
+                    continue
+
+                LOGGER.debug("Found legacy QCM file at %s, migrating", file_path_str)
+                content = await file_path.read_text(encoding="utf-8")
+                legacy_data: Any = json.loads(content)
+
+                if isinstance(legacy_data, dict):
+                    if self.data is None:
+                        self.data = {
+                            "qcm_questions": {},
+                            "qcm_selected_options": {},
+                        }
+
+                    migrated = False
+                    for question, propositions in legacy_data.items():
+                        if not isinstance(question, str):
+                            continue
+                        if isinstance(propositions, list):
+                            options = [str(opt) for opt in propositions]
+                        elif isinstance(propositions, str):
+                            options = [propositions]
+                        else:
+                            continue
+
+                        if not options:
+                            continue
+
+                        if question not in self.data["qcm_questions"]:
+                            self.data["qcm_questions"][question] = options
+                            migrated = True
+                        else:
+                            for opt in options:
+                                if opt not in self.data["qcm_questions"][question]:
+                                    self.data["qcm_questions"][question].append(opt)
+                                    migrated = True
+
+                        if question not in self.data["qcm_selected_options"]:
+                            self.data["qcm_selected_options"][question] = options[0]
+                            migrated = True
+
+                    if migrated:
+                        await self._async_save_qcm_data()
+                        LOGGER.debug(
+                            "Migrated QCM data from %s into coordinator data",
+                            file_path_str,
+                        )
+
+                        # Sync migrated data to any other ecole_directe config entries without QCM data
+                        for entry in self.hass.config_entries.async_entries(DOMAIN):
+                            if entry.entry_id != self.config_entry.entry_id:
+                                other_store = Store(
+                                    self.hass, 1, f"ecole_directe_qcm_{entry.entry_id}"
+                                )
+                                other_data = await other_store.async_load()
+                                if not other_data:
+                                    await other_store.async_save(
+                                        {
+                                            "qcm_questions": dict(
+                                                self.data["qcm_questions"]
+                                            ),
+                                            "qcm_selected_options": dict(
+                                                self.data["qcm_selected_options"]
+                                            ),
+                                        }
+                                    )
+
+                await file_path.unlink(missing_ok=True)
+                LOGGER.info(
+                    "Legacy QCM file '%s' migrated and deleted successfully",
+                    file_path_str,
+                )
+            except Exception as err:
+                LOGGER.warning(
+                    "Error while migrating legacy QCM file '%s': %s", file_path_str, err
+                )
+
+    async def _async_update_workspaces(
+        self,
+        client: EDApiClient,
+        previous_data: dict[str, Any] | None,
+    ) -> None:
+        """Fetch workspace data and emit events for changes since the last update."""
+        data_keys = ("workspaces", "wk_activities", "wk_postits")
+        try:
+            workspaces = await client.get_workspaces(client.id, client.account_type)
+            activities_by_workspace: dict[str, list[EDWorkspaceActivity]] = {}
+            postits_by_workspace: dict[str, list[EDWorkspacePostit]] = {}
+
+            for workspace in workspaces:
+                workspace_id = _get_workspace_id(workspace)
+                if workspace_id is None:
+                    LOGGER.warning(
+                        "Ignoring workspace without an identifier: %s", workspace
+                    )
+                    continue
+                activities_by_workspace[
+                    workspace_id
+                ] = await client.get_workspace_activities(
+                    workspace_id,
+                    client.id,
+                    str(client.account_type),
+                )
+                postits_by_workspace[workspace_id] = await client.get_workspace_postits(
+                    workspace_id
+                )
+
+            self.data["workspaces"] = workspaces
+            self.data["wk_activities"] = activities_by_workspace
+            self.data["wk_postits"] = postits_by_workspace
+        except Exception:
+            for key in data_keys:
+                if previous_data is not None and key in previous_data:
+                    self.data[key] = previous_data[key]
+            LOGGER.exception("Error getting workspace data from Ecole Directe")
+            return
+
+        self._compare_workspace_items(
+            previous_data,
+            "wk_postits",
+            "new_postit",
+        )
+        self._compare_workspace_items(
+            previous_data,
+            "wk_activities",
+            "new_activity",
+        )
+
+    def _compare_workspace_items(
+        self,
+        previous_data: dict[str, Any] | None,
+        data_key: str,
+        event_type: str,
+    ) -> None:
+        """Emit events only for workspace items with new identifiers or timestamps."""
+        if previous_data is None or data_key not in previous_data:
+            return
+
+        previous_items = previous_data[data_key]
+        current_items = self.data.get(data_key, {})
+        previous_signatures = {
+            (workspace_id, _workspace_item_signature(item))
+            for workspace_id, items in previous_items.items()
+            for item in items
+            if _workspace_item_signature(item) is not None
+        }
+        for workspace_id, items in current_items.items():
+            for item in items:
+                signature = _workspace_item_signature(item)
+                if (
+                    signature is not None
+                    and (workspace_id, signature) not in previous_signatures
+                ):
+                    self.trigger_event(event_type, None, item)
+
+    async def _async_update_data(self) -> Any:
+        """
+        Fetch data from API endpoint.
+
+        This is the only method that should be implemented in a DataUpdateCoordinator.
+        It is called automatically based on the update_interval.
+
+        Context-based fetching:
+        The coordinator tracks which entities are currently listening via async_contexts().
+        This allows optimizing API calls to only fetch data that's actually needed.
+        For example, if only sensor entities are enabled, we can skip fetching switch data.
+
+        The API client uses the credentials from config_entry to authenticate:
+        - username: from config_entry.data["username"]
+        - password: from config_entry.data["password"]
+
+        Expected API response structure (example):
+        {
+            "userId": 1,      # Used as device identifier
+            "id": 1,          # Data record ID
+            "title": "...",   # Additional metadata
+            "body": "...",    # Additional content
+            # In production, would include:
+            # "air_quality": {"aqi": 45, "pm25": 12.3},
+            # "filter": {"life_remaining": 75, "runtime_hours": 324},
+            # "settings": {"fan_speed": "medium", "humidity": 55}
+        }
+
+        Returns:
+            The data from the API as a dictionary.
+
+        Raises:
+            ConfigEntryAuthFailed: If authentication fails, triggers reauthentication.
+            UpdateFailed: If data fetching fails for other reasons, optionally with retry_after.
+
+        """
+        try:
+            if FAKE_ON:
+                LOGGER.info("DEBUG MODE ON")
+
+            previous_data = None if self.data is None else self.data.copy()
+
+            async with EDApiClient(
+                self.config_entry.data["username"],
+                self.config_entry.data["password"],
+                self.hass,
+            ) as client:
+                self._prepare_client(client)
+
+                try:
+                    await client.login()
+                except QCMException:
+                    LOGGER.warning("QCM verification pending for ecole directe client")
+                    return self.data
+                except Exception:
+                    LOGGER.critical("Unknown error on login")
+                    return self.data
+
+                await self._async_remember_trusted_device(client)
+                extras.retirer_eleves_deja_suivis(self, client)
+
+                # Some schools stop declaring a module for a pupil (enable=false)
+                # while the API still answers: optionally fetch them anyway.
+                if self.config_entry.options.get("forcer_modules", False):
+                    for eleve in client.eleves:
+                        for code in FORCED_MODULES:
+                            if code not in eleve.modules:
+                                eleve.modules.append(code)
+
+                # Preserve QCM data across updates so saved questions persist
+                previous_qcm_questions = (self.data or {}).get("qcm_questions", {})
+                previous_qcm_selected_options = (self.data or {}).get(
+                    "qcm_selected_options", {}
+                )
+
+                self.data = {
+                    "session": client,
+                    "qcm_questions": previous_qcm_questions,
+                    "qcm_selected_options": previous_qcm_selected_options,
+                }
+                await self._async_update_workspaces(client, previous_data)
+
+                current_year = datetime.now(self.timezone).year
+                if datetime.now(self.timezone).month >= AUGUST:
+                    year_data = f"{current_year!s}-{(current_year + 1)!s}"
+                else:
+                    year_data = f"{(current_year - 1)!s}-{current_year!s}"
+
+                # EDT BODY
+                today = datetime.now(self.timezone).date()
+                tomorrow = datetime.now(self.timezone).date() + timedelta(days=1)
+
+                current_week_begin = datetime.now(self.timezone).date() - timedelta(
+                    days=datetime.now(self.timezone).weekday()
+                )
+
+                current_week_plus_21 = current_week_begin + timedelta(days=21)
+                current_week_end = current_week_begin + timedelta(days=6)
+                next_week_begin = current_week_end + timedelta(days=1)
+                next_week_end = next_week_begin + timedelta(days=6)
+                after_next_week_begin = next_week_end + timedelta(days=1)
+
+                if client.account_type == "P":  # professor ???
+                    try:
+                        for classe in client.data["accounts"][0]["profile"]["classes"]:
+                            await client.get_classe(
+                                classe["id"],
+                            )
+                    except Exception:
+                        LOGGER.exception("Error getting classes")
+
+                if client.account_type == "1":  # famille
+                    if "MESSAGERIE" in client.modules:
+                        try:
+                            self.data["messagerie"] = await client.get_messages(
+                                client.id,
+                                None,
+                                year_data,
+                            )
+
+                        except Exception:
+                            LOGGER.exception(
+                                "Error getting messages for family from ecole directe"
+                            )
+
+                    if FAKE_ON or "EDFORMS" in client.modules:
+                        try:
+                            self.data["formulaires"] = await client.get_formulaires(
+                                year_data,
+                                client.account_type,
+                                client.id,
+                            )
+                            self.compare_data(
+                                previous_data,
+                                "formulaires",
+                                ["created", "titre"],
+                                "new_formulaire",
+                                None,
+                            )
+                        except Exception:
+                            LOGGER.exception(
+                                "Error getting formulaires from ecole directe"
+                            )
+
+                # START: MODIFIED FOR WALLET BALANCE (SINGLE CALL)
+                all_balances = None
+                try:
+                    all_balances = await client.get_all_wallet_balances()
+                    if all_balances and f"{client.id}" in all_balances:
+                        self.data["wallets"] = all_balances[f"{client.id}"]
+                except Exception:
+                    LOGGER.exception(
+                        "Error getting all wallet balances from ecole directe"
+                    )
+                # END: MODIFIED FOR WALLET BALANCE (SINGLE CALL)
+
+                # Rubriques supplémentaires (ajout Kerherve)
+                extras.debut_cycle(self, previous_data)
+                await extras.maj_compte(self, client)
+
+                for eleve in client.eleves:
+                    # Switch account context if this child belongs to a different account
+                    if eleve.account_id_login is not None:
+                        try:
+                            await client.switch_account(eleve.account_id_login)
+                        except Exception:
+                            LOGGER.exception(
+                                "Error switching account for %s",
+                                eleve.get_fullname(),
+                            )
+                            continue
+
+                    # START: DISTRIBUTE WALLET BALANCE DATA
+                    if all_balances and eleve.eleve_id in all_balances:
+                        wallets_key = f"{eleve.get_fullname_lower()}_wallets"
+                        self.data[wallets_key] = all_balances[eleve.eleve_id]
+                    # END: DISTRIBUTE WALLET BALANCE DATA
+
+                    if FAKE_ON or "CAHIER_DE_TEXTES" in eleve.modules:
+                        try:
+                            homeworks = await client.get_homeworks(
+                                eleve,
+                                self.config_entry.options.get("decode_html", False),
+                            )
+
+                            self.data[f"{eleve.get_fullname_lower()}_homeworks"] = (
+                                homeworks
+                            )
+
+                            self.compare_data(
+                                previous_data,
+                                f"{eleve.get_fullname_lower()}_homeworks",
+                                ["date", "matiere", "short_description"],
+                                "new_devoir",
+                                eleve,
+                            )
+
+                            self.data[
+                                f"{eleve.get_fullname_lower()}_homeworks_today"
+                            ] = list(
+                                filter(
+                                    lambda homework: (
+                                        homework["date"]
+                                        .astimezone(self.timezone)
+                                        .date()
+                                        == today
+                                    ),
+                                    homeworks,
+                                )
+                            )
+                            homeworks_tomorrow = list(
+                                filter(
+                                    lambda homework: (
+                                        homework["date"]
+                                        .astimezone(self.timezone)
+                                        .date()
+                                        == tomorrow
+                                    ),
+                                    homeworks,
+                                )
+                            )
+                            self.data[
+                                f"{eleve.get_fullname_lower()}_homeworks_tomorrow"
+                            ] = homeworks_tomorrow
+                            self.data[
+                                f"{eleve.get_fullname_lower()}_homeworks_next_day"
+                            ] = get_next_day_list(
+                                homeworks,
+                                homeworks_tomorrow,
+                                tomorrow,
+                                "date",
+                            )
+
+                            self.data[f"{eleve.get_fullname_lower()}_homeworks_1"] = (
+                                list(
+                                    filter(
+                                        lambda homework: (
+                                            homework["date"]
+                                            .astimezone(self.timezone)
+                                            .date()
+                                            >= current_week_begin
+                                            and homework["date"]
+                                            .astimezone(self.timezone)
+                                            .date()
+                                            <= current_week_end
+                                        ),
+                                        homeworks,
+                                    )
+                                )
+                            )
+                            self.data[f"{eleve.get_fullname_lower()}_homeworks_2"] = (
+                                list(
+                                    filter(
+                                        lambda homework: (
+                                            homework["date"]
+                                            .astimezone(self.timezone)
+                                            .date()
+                                            >= next_week_begin
+                                            and homework["date"]
+                                            .astimezone(self.timezone)
+                                            .date()
+                                            <= next_week_end
+                                        ),
+                                        homeworks,
+                                    )
+                                )
+                            )
+                            self.data[f"{eleve.get_fullname_lower()}_homeworks_3"] = (
+                                list(
+                                    filter(
+                                        lambda homework: (
+                                            homework["date"]
+                                            .astimezone(self.timezone)
+                                            .date()
+                                            >= after_next_week_begin
+                                        ),
+                                        homeworks,
+                                    )
+                                )
+                            )
+
+                            timetable_week1_key = (
+                                f"{eleve.get_fullname_lower()}_timetable_1"
+                            )
+                            timetable_week2_key = (
+                                f"{eleve.get_fullname_lower()}_timetable_2"
+                            )
+                            timetable_week3_key = (
+                                f"{eleve.get_fullname_lower()}_timetable_3"
+                            )
+
+                            self.compare_timetables(previous_data, eleve)
+
+                        except Exception:
+                            LOGGER.exception(
+                                "Error getting homeworks from ecole directe"
+                            )
+                    if FAKE_ON or "NOTES" in eleve.modules:
+                        try:
+                            grades_evaluations = await client.get_grades_evaluations(
+                                eleve,
+                                year_data,
+                                self.config_entry.options.get(
+                                    "notes_affichees", GRADES_TO_DISPLAY
+                                ),
+                            )
+                            if "disciplines" in grades_evaluations:
+                                disciplines = grades_evaluations["disciplines"]
+                                self.data[
+                                    f"{eleve.get_fullname_lower()}_disciplines"
+                                ] = disciplines
+                                for discipline in disciplines:
+                                    self.data[
+                                        f"{eleve.get_fullname_lower()}_{get_unique_id(discipline['nom'])}"
+                                    ] = discipline
+
+                            if "moyenne_generale" in grades_evaluations:
+                                self.data[
+                                    f"{eleve.get_fullname_lower()}_moyenne_generale"
+                                ] = grades_evaluations["moyenne_generale"]
+
+                            self.data[f"{eleve.get_fullname_lower()}_notes"] = (
+                                grades_evaluations["notes"]
+                            )
+                            self.compare_data(
+                                previous_data,
+                                f"{eleve.get_fullname_lower()}_notes",
+                                ["date", "matiere", "commentaire"],
+                                "new_note",
+                                eleve,
+                            )
+
+                            self.data[f"{eleve.get_fullname_lower()}_evaluations"] = (
+                                grades_evaluations["evaluations"]
+                            )
+                            self.compare_data(
+                                previous_data,
+                                f"{eleve.get_fullname_lower()}_evaluations",
+                                ["date", "matiere", "devoir"],
+                                "new_evaluation",
+                                eleve,
+                            )
+
+                            self.data[
+                                f"{eleve.get_fullname_lower()}_periodes_moyennes"
+                            ] = grades_evaluations.get("periodes", [])
+                        except Exception:
+                            LOGGER.exception("Error getting grades from ecole directe")
+
+                    if FAKE_ON or "EDT" in eleve.modules:
+                        try:
+                            break_time = self.config_entry.options.get(
+                                "lunch_break_time", DEFAULT_LUNCH_BREAK_TIME
+                            )
+                            lunch_break_time = datetime.strptime(
+                                break_time,
+                                "%H:%M",
+                            ).time()
+
+                            lessons = await client.get_lessons(
+                                eleve,
+                                current_week_begin.strftime("%Y-%m-%d"),
+                                current_week_plus_21.strftime("%Y-%m-%d"),
+                                lunch_break_time,
+                            )
+                            self.data[
+                                f"{eleve.get_fullname_lower()}_timetable_today"
+                            ] = list(
+                                filter(
+                                    lambda lesson: (
+                                        lesson["start"].astimezone(self.timezone).date()
+                                        == today
+                                    ),
+                                    lessons,
+                                )
+                            )
+                            lessons_tomorrow = list(
+                                filter(
+                                    lambda lesson: (
+                                        lesson["start"].astimezone(self.timezone).date()
+                                        == tomorrow
+                                    ),
+                                    lessons,
+                                )
+                            )
+                            self.data[
+                                f"{eleve.get_fullname_lower()}_timetable_tomorrow"
+                            ] = lessons_tomorrow
+                            self.data[
+                                f"{eleve.get_fullname_lower()}_timetable_next_day"
+                            ] = get_next_day_list(
+                                lessons,
+                                lessons_tomorrow,
+                                tomorrow,
+                                "start",
+                            )
+                            self.data[f"{eleve.get_fullname_lower()}_timetable_1"] = (
+                                list(
+                                    filter(
+                                        lambda lesson: (
+                                            lesson["start"]
+                                            .astimezone(self.timezone)
+                                            .date()
+                                            >= current_week_begin
+                                            and lesson["start"]
+                                            .astimezone(self.timezone)
+                                            .date()
+                                            <= current_week_end
+                                        ),
+                                        lessons,
+                                    )
+                                )
+                            )
+                            self.data[f"{eleve.get_fullname_lower()}_timetable_2"] = (
+                                list(
+                                    filter(
+                                        lambda lesson: (
+                                            lesson["start"]
+                                            .astimezone(self.timezone)
+                                            .date()
+                                            >= next_week_begin
+                                            and lesson["start"]
+                                            .astimezone(self.timezone)
+                                            .date()
+                                            <= next_week_end
+                                        ),
+                                        lessons,
+                                    )
+                                )
+                            )
+                            self.data[f"{eleve.get_fullname_lower()}_timetable_3"] = (
+                                list(
+                                    filter(
+                                        lambda lesson: (
+                                            lesson["start"]
+                                            .astimezone(self.timezone)
+                                            .date()
+                                            >= after_next_week_begin
+                                        ),
+                                        lessons,
+                                    )
+                                )
+                            )
+
+                            if (
+                                previous_data is not None
+                                and timetable_week1_key in previous_data
+                                and timetable_week1_key in self.data
+                                and self._is_same_week(
+                                    previous_data[timetable_week1_key],
+                                    current_week_begin,
+                                )
+                                and self._is_same_week(
+                                    self.data[timetable_week1_key], current_week_begin
+                                )
+                            ):
+                                self.compare_data_with_identifier(
+                                    previous_data,
+                                    timetable_week1_key,
+                                    [
+                                        "start_at",
+                                        "end_at",
+                                        "lesson",
+                                        "salle",
+                                        "prof",
+                                        "is_modifie",
+                                        "is_annule",
+                                    ],
+                                    "edt_changement",
+                                    eleve,
+                                    item_identifier="id",
+                                )
+                            if (
+                                previous_data is not None
+                                and timetable_week2_key in previous_data
+                                and timetable_week2_key in self.data
+                                and self._is_same_week(
+                                    previous_data[timetable_week2_key],
+                                    next_week_begin,
+                                )
+                                and self._is_same_week(
+                                    self.data[timetable_week2_key], next_week_begin
+                                )
+                            ):
+                                self.compare_data_with_identifier(
+                                    previous_data,
+                                    timetable_week2_key,
+                                    [
+                                        "start_at",
+                                        "end_at",
+                                        "lesson",
+                                        "salle",
+                                        "prof",
+                                        "is_modifie",
+                                        "is_annule",
+                                    ],
+                                    "edt_changement",
+                                    eleve,
+                                    item_identifier="id",
+                                )
+
+                            if (
+                                previous_data is not None
+                                and timetable_week3_key in previous_data
+                                and timetable_week3_key in self.data
+                                and self._is_same_week(
+                                    previous_data[timetable_week3_key],
+                                    after_next_week_begin,
+                                )
+                                and self._is_same_week(
+                                    self.data[timetable_week3_key],
+                                    after_next_week_begin,
+                                )
+                            ):
+                                self.compare_data_with_identifier(
+                                    previous_data,
+                                    timetable_week3_key,
+                                    [
+                                        "start_at",
+                                        "end_at",
+                                        "lesson",
+                                        "salle",
+                                        "prof",
+                                        "is_modifie",
+                                        "is_annule",
+                                    ],
+                                    "edt_changement",
+                                    eleve,
+                                    item_identifier="id",
+                                )
+                        except Exception:
+                            LOGGER.exception("Error getting Lessons from ecole directe")
+
+                    if FAKE_ON or "VIE_SCOLAIRE" in eleve.modules:
+                        try:
+                            vie_scolaire = await client.get_vie_scolaire(eleve)
+                            if "absences" in vie_scolaire:
+                                self.data[f"{eleve.get_fullname_lower()}_absences"] = (
+                                    vie_scolaire["absences"]
+                                )
+
+                                self.compare_data(
+                                    previous_data,
+                                    f"{eleve.get_fullname_lower()}_absences",
+                                    ["date", "type_element", "display_date"],
+                                    "new_absence",
+                                    eleve,
+                                )
+                            if "retards" in vie_scolaire:
+                                self.data[f"{eleve.get_fullname_lower()}_retards"] = (
+                                    vie_scolaire["retards"]
+                                )
+                                self.compare_data(
+                                    previous_data,
+                                    f"{eleve.get_fullname_lower()}_retards",
+                                    ["date", "type_element", "display_date"],
+                                    "new_retard",
+                                    eleve,
+                                )
+                            if "sanctions" in vie_scolaire:
+                                self.data[f"{eleve.get_fullname_lower()}_sanctions"] = (
+                                    vie_scolaire["sanctions"]
+                                )
+                                self.compare_data(
+                                    previous_data,
+                                    f"{eleve.get_fullname_lower()}_sanctions",
+                                    ["date", "type_element", "display_date"],
+                                    "new_sanction",
+                                    eleve,
+                                )
+                            if "encouragements" in vie_scolaire:
+                                self.data[
+                                    f"{eleve.get_fullname_lower()}_encouragements"
+                                ] = vie_scolaire["encouragements"]
+                                self.compare_data(
+                                    previous_data,
+                                    f"{eleve.get_fullname_lower()}_encouragements",
+                                    ["date", "type_element", "display_date"],
+                                    "new_encouragement",
+                                    eleve,
+                                )
+                        except Exception:
+                            LOGGER.exception(
+                                "Error getting vie scolaire from ecole directe"
+                            )
+                    if FAKE_ON or "MESSAGERIE" in eleve.modules:
+                        try:
+                            self.data[
+                                f"{eleve.get_fullname_lower()}_messagerie"
+                            ] = await client.get_messages(
+                                client.id,
+                                eleve,
+                                year_data,
+                            )
+                        except Exception:
+                            LOGGER.exception(
+                                "Error getting messages from ecole directe"
+                            )
+
+                    await extras.maj_eleve(self, client, eleve, previous_data)
+
+                extras.fin_cycle(self)
+        except EDApiClientAuthenticationError as exception:
+            LOGGER.warning("Authentication error - %s", exception)
+            raise ConfigEntryAuthFailed(
+                translation_domain="ecole_directe",
+                translation_key="authentication_failed",
+            ) from exception
+        except EDApiClientError as exception:
+            LOGGER.exception("Error communicating with API")
+            raise UpdateFailed(
+                translation_domain="ecole_directe",
+                translation_key="update_failed",
+            ) from exception
+
+        return self.data
+
+    def compare_data(
+        self,
+        previous_data: dict | None,
+        data_key: str,
+        compare_keys: list[str],
+        event_type: str,
+        eleve: EDEleve | None,
+    ) -> None:
+        """Compare data from previous session."""
+        try:
+            if (
+                previous_data is not None
+                and data_key in previous_data
+                and data_key in self.data
+            ):
+                not_found_items = []
+                for item in self.data[data_key]:
+                    found = False
+                    for previous_item in previous_data[data_key]:
+                        if {key: previous_item[key] for key in compare_keys} == {
+                            key: item[key] for key in compare_keys
+                        }:
+                            found = True
+                            break
+                    if not found:
+                        not_found_items.append(item)
+                for not_found_item in not_found_items:
+                    self.trigger_event(event_type, eleve, not_found_item)
+        except Exception:
+            LOGGER.exception(
+                "Error comparing data: self[%s] previous_data[%s] data_key[%s]",
+                self,
+                previous_data,
+                data_key,
+            )
+
+    def compare_data_with_identifier(
+        self,
+        previous_data: dict | None,
+        data_key: str,
+        compare_keys: list[str],
+        event_type: str,
+        eleve: EDEleve | None,
+        item_identifier: str | None = None,
+    ) -> None:
+        """Compare data and include matching previous item when available.
+
+        Returns events with a payload containing both the `previous` and
+        `current` item when a matching previous item exists (or `None` if not).
+        Matching is attempted first by `item_identifier` (if provided) and
+        then by `compare_keys` as a fallback.
+        """
+        try:
+            if (
+                previous_data is None
+                or data_key not in previous_data
+                or data_key not in self.data
+            ):
+                return
+
+            not_found_items: list[dict] = []
+
+            for item in self.data[data_key]:
+                found = False
+                matched_previous = None
+
+                for previous_item in previous_data[data_key]:
+                    # Identifier le même cours avec son ID
+                    if (
+                        item_identifier is not None
+                        and item_identifier in item
+                        and item_identifier in previous_item
+                        and item[item_identifier] == previous_item[item_identifier]
+                    ):
+                        matched_previous = previous_item
+
+                        previous_values = {
+                            key: previous_item.get(key) for key in compare_keys
+                        }
+
+                        current_values = {key: item.get(key) for key in compare_keys}
+
+                        if previous_values == current_values:
+                            found = True
+                        break
+
+                if not found:
+                    changes = {}
+
+                    if matched_previous is not None:
+                        for key in compare_keys:
+                            previous_value = matched_previous.get(key)
+                            current_value = item.get(key)
+
+                            if previous_value != current_value:
+                                changes[key] = {
+                                    "previous": previous_value,
+                                    "current": current_value,
+                                }
+
+                    not_found_items.append(
+                        {
+                            "id": item.get(item_identifier)
+                            if item_identifier
+                            else None,
+                            "lesson": item.get("lesson"),
+                            "start": item.get("start"),
+                            "end": item.get("end"),
+                            "previous": matched_previous,
+                            "current": item,
+                            "changes": changes,
+                        }
+                    )
+
+            for not_found_item in not_found_items:
+                self.trigger_event(
+                    event_type,
+                    eleve,
+                    not_found_item,
+                )
+
+        except Exception:
+            LOGGER.exception(
+                "Error comparing data: self[%s] previous_data[%s] data_key[%s]",
+                self,
+                previous_data,
+                data_key,
+            )
+
+    def _is_same_week(self, lessons: list, week_begin: date) -> bool:
+        """Return True if lesson list belongs to the requested week."""
+        if len(lessons) == 0:
+            return False
+        lesson_date = lessons[0]["start"].astimezone(self.timezone).date()
+        return week_begin <= lesson_date <= week_begin + timedelta(days=6)
+
+    def trigger_event(self, event_type: str, eleve: EDEleve | None, data: Any) -> None:
+        """Trigger an event if there is new data."""
+        name = "" if eleve is None else eleve.get_fullname()
+
+        event_data = {
+            "child_name": name,
+            "type": event_type,
+            "data": data,
+        }
+        self.hass.bus.fire(EVENT_TYPE, event_data)
+
+    @staticmethod
+    def _lesson_key(lesson: dict) -> tuple:
+        """Clé d'identification d'un cours (id si dispo, sinon créneau)."""
+        if lesson.get("id") is not None:
+            return ("id", lesson["id"])
+        return (
+            "slot",
+            lesson.get("start_at"),
+            lesson.get("lesson"),
+            lesson.get("groupe_id"),
+        )
+
+    def compare_timetables(self, previous_data: dict | None, eleve: EDEleve) -> None:
+        """Détecte les changements d'EDT sur les 3 semaines, jour par jour."""
+        if previous_data is None:
+            return
+        try:
+            prefix = eleve.get_fullname_lower()
+            keys = [f"{prefix}_timetable_{i}" for i in (1, 2, 3)]
+            previous = [m for k in keys for m in (previous_data.get(k) or [])]
+            current = [n for k in keys for n in (self.data.get(k) or [])]
+            if not previous:
+                return
+
+            compare_keys = [
+                "start_at",
+                "end_at",
+                "lesson",
+                "salle",
+                "prof",
+                "is_modifie",
+                "is_annule",
+            ]
+            previous_by_key = {self._lesson_key(m): m for m in previous}
+            known_days = {n["start"].astimezone(self.timezone).date() for n in previous}
+
+            for item in current:
+                day = item["start"].astimezone(self.timezone).date()
+                if day not in known_days:
+                    continue  # jour/semaine qui vient d'apparaître : pas un changement
+
+                matched_previous = previous_by_key.get(self._lesson_key(item))
+                changes = {}
+                if matched_previous is not None:
+                    for key in compare_keys:
+                        if matched_previous.get(key) != item.get(key):
+                            changes[key] = {
+                                "previous": matched_previous.get(key),
+                                "current": item.get(key),
+                            }
+                    if not changes:
+                        continue  # cours identique
+
+                self.trigger_event(
+                    "edt_changement",
+                    eleve,
+                    {
+                        "id": item.get("id"),
+                        "lesson": item.get("lesson"),
+                        "start": item.get("start"),
+                        "end": item.get("end"),
+                        "previous": matched_previous,
+                        "current": item,
+                        "changes": changes,
+                    },
+                )
+        except Exception:
+            LOGGER.exception("Error comparing timetables")
+
+
+def _get_workspace_id(workspace: dict[str, Any]) -> str | None:
+    """Return a workspace identifier from an API object."""
+    for key in ("id", "idEspace", "espaceId", "workspaceId"):
+        value = workspace.get(key)
+        if value is not None:
+            return str(value)
+    return None
+
+
+def _workspace_item_signature(
+    item: dict[str, Any],
+) -> tuple[str | None, str | None] | None:
+    """Return an identifier/timestamp pair for an activity or post-it."""
+    identifier = next(
+        (str(item[key]) for key in ("id") if item.get(key) is not None),
+        None,
+    )
+    timestamp = next(
+        (
+            str(item[key])
+            for key in (
+                "dateCreation",
+                "date",
+            )
+            if item.get(key) is not None
+        ),
+        None,
+    )
+    if identifier is None and timestamp is None:
+        return None
+    return identifier, timestamp
+
+
+def get_next_day_list(
+    my_list: list, list_next_day: list, next_day: date, field: str = "start"
+) -> list | None:
+    """Get next day lessons."""
+    if len(my_list) == 0:
+        return None
+    if my_list[-1][field].date() < next_day:
+        return None
+    if len(list_next_day) == 0:
+        next_day = next_day + timedelta(days=1)
+        list_next_day = list(
+            filter(
+                lambda lesson: lesson[field].date() == next_day,
+                my_list,
+            )
+        )
+        return get_next_day_list(my_list, list_next_day, next_day, field)
+    return list_next_day

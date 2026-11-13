@@ -1,0 +1,1158 @@
+# Copyright (c) 2024-2026
+# SPDX-License-Identifier: MIT
+
+"""
+API Client for ecole_directe.
+
+This module provides the API client for communicating with external services.
+It demonstrates proper error handling, authentication patterns, and async operations.
+
+For more information on creating API clients:
+https://developers.home-assistant.io/docs/api_lib_index
+"""
+
+from __future__ import annotations
+
+import base64
+import json
+import operator
+import re
+from contextlib import suppress
+from datetime import datetime, time
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, NotRequired, Self, TypedDict, cast
+
+import anyio
+from aiohttp import CookieJar
+from ecoledirecte_api.client import EDClient, QCMException
+from ecoledirecte_api.const import ED_OK
+
+from custom_components.ecole_directe.helpers import get_unique_id
+
+from ..const import (
+    EVENT_TYPE,
+    FAKE_ON,
+    GRADES_TO_DISPLAY,
+    HOMEWORK_DESC_MAX_LENGTH,
+    INTEGRATION_PATH,
+    LOGGER,
+    VIE_SCOLAIRE_TO_DISPLAY,
+)
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
+    from types import TracebackType
+
+    from homeassistant.core import HomeAssistant
+
+# as per recommendation from @freylis, compile once only
+CLEANR = re.compile("<.*?>")
+
+
+class EDApiClientError(Exception):
+    """Base exception to indicate a general API error."""
+
+
+class EDApiClientCommunicationError(
+    EDApiClientError,
+):
+    """Exception to indicate a communication error with the API."""
+
+
+class EDApiClientAuthenticationError(
+    EDApiClientError,
+):
+    """Exception to indicate an authentication error with the API."""
+
+
+class EDEleve:
+    """Student information."""
+
+    def __init__(
+        self,
+        modules: list[str],
+        data: Any = None,
+        establishment: str = "",
+        eleve_id: str | None = None,
+        first_name: str | None = None,
+        last_name: str | None = None,
+        classe_id: str | None = None,
+        classe_name: str | None = None,
+        account_id_login: int | None = None,
+    ) -> None:
+        """Save student information."""
+        self.account_id_login = account_id_login
+        if data is None:
+            self.classe_id = classe_id
+            self.classe_name: str = classe_name if classe_name is not None else ""
+            self.eleve_id: str = eleve_id if eleve_id is not None else ""
+            self.eleve_lastname: str = last_name if last_name is not None else ""
+            self.eleve_firstname: str = first_name if first_name is not None else ""
+            self.modules: list[str] = modules
+            self.establishment = establishment
+        else:
+            if "classe" in data:
+                self.classe_id = data["classe"]["id"]
+                self.classe_name = data["classe"]["libelle"]
+            else:
+                self.classe_id = ""
+                self.classe_name = ""
+            self.eleve_id: str = str(data["id"])
+            self.eleve_lastname = data["nom"]
+            self.eleve_firstname = data["prenom"]
+
+            self.establishment = establishment
+            self.modules = []
+            for module in data["modules"]:
+                if module["enable"]:
+                    self.modules.append(module["code"])
+
+    def get_fullname_lower(self) -> str:
+        """Student fullname lowercase."""
+        return get_unique_id(f"{self.get_fullname()}")
+
+    def get_fullname(self) -> str:
+        """Student fullname."""
+        return f"{self.eleve_firstname} {self.eleve_lastname}"
+
+
+class EDWorkspacePostitAuthor(TypedDict):
+    """Author information for a workspace post-it."""
+
+    civilite: str
+    id: str
+    nom: str
+    particule: str
+    prenom: str
+    type: str
+
+
+class EDWorkspacePostit(TypedDict):
+    """Structured workspace post-it returned by Ecole Directe."""
+
+    auteur: EDWorkspacePostitAuthor
+    cible: list[str]
+    ciblesEtab: list[object]
+    contenu: str
+    dateCreation: str
+    dateDebut: str
+    dateFin: str
+    id: int
+    ordre: int
+    type: str
+
+
+class EDWorkspaceActivityMember(TypedDict):
+    """Workspace activity member information."""
+
+    id: int
+    profil: str
+
+
+class EDWorkspaceActivity(TypedDict):
+    """Structured workspace activity returned by Ecole Directe."""
+
+    cible: str
+    date: str
+    descriptif: str
+    id: int
+    membre: EDWorkspaceActivityMember
+    cloud_details: NotRequired[dict[str, Any]]
+
+
+class EDApiClient:
+    """Ecole Directe client with Token and cookie."""
+
+    def __init__(
+        self,
+        user: str,
+        pwd: str,
+        hass: HomeAssistant,
+    ) -> None:
+        """Save some information needed to login the client."""
+        self.hass = hass
+        self.username = user
+        self.password = pwd
+        self.qcm_json: dict[str, list[str]] = {}
+        # Trusted device returned by Ecole Directe after a successful QCM.
+        # Set both before login() to skip the QCM; read both after login()
+        # to persist the (possibly renewed) couple.
+        self.cn: str | None = None
+        self.cv: str | None = None
+        self.log_folder = self.hass.config.config_dir + INTEGRATION_PATH + "logs/"
+        self.test_folder = self.hass.config.config_dir + INTEGRATION_PATH + "test/"
+        Path(self.log_folder).mkdir(parents=True, exist_ok=True)
+
+    async def __aenter__(self) -> Self:
+        """Enter the client context."""
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        """Exit the client context."""
+        await self.close()
+
+    async def close(self) -> None:
+        """Close the client."""
+        # ed_client only exists once login() ran: leaving the context after an
+        # early failure must not raise (see #255).
+        ed_client = getattr(self, "ed_client", None)
+        if ed_client is not None:
+            await ed_client.close()
+
+    async def save_question(self, qcm_json: Any) -> None:
+        """Handle a new QCM question."""
+        if isinstance(qcm_json, dict):
+            self.qcm_json = qcm_json
+
+        event_data = {
+            "child_name": None,
+            "type": "new_qcm",
+            "qcm_json": qcm_json,
+        }
+        self.hass.bus.fire(EVENT_TYPE, event_data)
+        LOGGER.debug("QCM question received")
+
+    async def set_qcm_answer(self, question: str, answer: str) -> None:
+        """Set the selected QCM answer for the next login attempt."""
+        self.qcm_json[question] = [answer]
+
+    def _new_ed_client(self) -> EDClient:
+        """Create a library client wired to the QCM callback."""
+        ed_client = EDClient(
+            username=self.username,
+            password=self.password,
+            qcm_json=self.qcm_json,
+        )
+        ed_client.on_new_question(self.save_question)
+        return ed_client
+
+    @staticmethod
+    def _is_login_ok(login: Any) -> bool:
+        """Return True when the login response carries a usable session."""
+        return (
+            isinstance(login, dict)
+            and login.get("code") == ED_OK
+            and isinstance(login.get("data"), dict)
+            and bool(login["data"].get("accounts"))
+        )
+
+    async def login(self) -> Any:
+        """
+        Login to Ecole Directe.
+
+        Every login without a trusted device is seen by Ecole Directe as a
+        "new device": it requires the QCM and counts towards the account
+        lockout ("tentatives infructueuses de connexion"), which triggers
+        after a handful of such logins. The cn/cv couple returned after a
+        successful QCM identifies this device; sent back in the "fa" field of
+        the next logins (as the official mobile application does) it makes
+        the QCM unnecessary. The coordinator persists it between updates.
+        """
+        self.ed_client: EDClient = self._new_ed_client()
+        trusted = bool(self.cn and self.cv)
+        if trusted:
+            # The library skips the password-only login (and thus the QCM)
+            # only when cn/cv are set and cookie_jar is not None.
+            self.ed_client.cn = self.cn
+            self.ed_client.cv = self.cv
+            self.ed_client.cookie_jar = CookieJar()
+            LOGGER.debug("Login with trusted device (no QCM)")
+        login = await self.ed_client.login()
+
+        if trusted and not self._is_login_ok(login):
+            # Trusted device revoked or expired (typically code 250): fall back
+            # to a full login, Ecole Directe will ask the QCM again and return
+            # a new cn/cv couple.
+            LOGGER.warning(
+                "Trusted device no longer accepted by Ecole Directe (code %s): "
+                "new QCM validation",
+                login.get("code") if isinstance(login, dict) else login,
+            )
+            await self.ed_client.close()
+            self.cn = None
+            self.cv = None
+            self.ed_client = self._new_ed_client()
+            login = await self.ed_client.login()
+
+        # Expose the (possibly renewed) trusted device for persistence.
+        self.cn = self.ed_client.cn
+        self.cv = self.ed_client.cv
+        LOGGER.debug(login)
+        LOGGER.info(
+            "Connection OK - identifiant: [%s]",
+            login["data"]["accounts"][0]["identifiant"],
+        )
+        LOGGER.debug(
+            "token: [%s] - cookies: [%s]",
+            self.ed_client.token,
+            self.ed_client.cookie_jar,
+        )
+
+        self.data = login["data"]
+        if FAKE_ON:
+            self.data["accounts"][0]["profile"]["eleves"][0]["id"] = "2232"
+            self.data["accounts"][0]["profile"]["eleves"][0]["prenom"] = "Benjamin"
+            self.data["accounts"][0]["profile"]["eleves"][0]["nom"] = "No Name"
+            self.data["accounts"][0]["profile"]["eleves"][1]["id"] = "2233"
+            self.data["accounts"][0]["profile"]["eleves"][1]["prenom"] = "Arthur"
+            self.data["accounts"][0]["profile"]["eleves"][1]["nom"] = "No Name"
+
+        main_account = next(
+            (a for a in self.data["accounts"] if a.get("main", False)),
+            self.data["accounts"][0],
+        )
+
+        self.id = main_account["id"]
+        self.identifiant = main_account["identifiant"]
+        self.id_login = main_account["idLogin"]
+        self.account_type = main_account["typeCompte"]
+        self.modules = [m["code"] for m in main_account["modules"] if m["enable"]]
+        self.current_account_id_login = main_account["idLogin"]
+
+        # Collect children from ALL accounts (not just the main one)
+        self.eleves = []
+        for account in self.data["accounts"]:
+            if account["typeCompte"] == "E":
+                account_modules = [m["code"] for m in account["modules"] if m["enable"]]
+                self.eleves.append(
+                    EDEleve(
+                        account_modules,
+                        None,
+                        account["nomEtablissement"],
+                        account["id"],
+                        account["prenom"],
+                        account["nom"],
+                        account["profile"]["classe"]["id"],
+                        account["profile"]["classe"]["libelle"],
+                        account_id_login=account["idLogin"],
+                    )
+                )
+            elif "eleves" in account.get("profile", {}):
+                for eleve in account["profile"]["eleves"]:
+                    self.eleves.append(
+                        EDEleve(
+                            [],
+                            eleve,
+                            account["nomEtablissement"],
+                            account_id_login=account["idLogin"],
+                        )
+                    )
+
+    async def switch_account(self, target_id_login: int) -> None:
+        """Switch the API session context to a different account."""
+        if target_id_login == self.current_account_id_login:
+            return
+        await self.ed_client.switch_account(target_id_login)
+        self.current_account_id_login = target_id_login
+
+    async def get_messages(
+        self,
+        family_id: str | None,
+        eleve: EDEleve | None,
+        annee_scolaire: str,
+    ) -> Any | None:
+        """Get messages from Ecole Directe."""
+        if FAKE_ON:
+            if eleve is None:
+                json_resp = await load_json_file(
+                    self.test_folder + "get_messages_famille.json"
+                )
+            else:
+                json_resp = await load_json_file(
+                    self.test_folder + f"{eleve.eleve_id}_get_messages_eleve.json"
+                )
+
+        elif eleve is None:
+            json_resp = await self.ed_client.get_messages(
+                family_id, None, annee_scolaire
+            )
+            await save_json_file(
+                json_resp, self.log_folder + "get_messages_famille.json"
+            )
+        else:
+            json_resp = await self.ed_client.get_messages(
+                None, eleve.eleve_id, annee_scolaire
+            )
+            await save_json_file(
+                json_resp, self.log_folder + f"{eleve.eleve_id}_get_messages_eleve.json"
+            )
+
+        if "data" not in json_resp:
+            LOGGER.warning("get_messages: [%s]", json_resp)
+            return None
+
+        return json_resp["data"]["pagination"]
+
+    async def get_homeworks_by_date(self, eleve: EDEleve, date: str) -> dict:
+        """Get homeworks by date."""
+        if FAKE_ON:
+            json_resp = await load_json_file(
+                self.test_folder
+                + f"{eleve.eleve_id}_get_homeworks_by_date_"
+                + date
+                + ".json"
+            )
+            return json_resp["data"]
+
+        json_resp = await self.ed_client.get_homeworks_by_date(
+            eleve.eleve_id,
+            date,
+        )
+        await save_json_file(
+            json_resp,
+            self.log_folder + f"{eleve.eleve_id}_get_homeworks_by_date_{date}.json",
+        )
+        if "data" in json_resp:
+            return json_resp["data"]
+        LOGGER.warning("get_homeworks_by_date: [%s]", json_resp)
+        return {}
+
+    async def get_homeworks(self, eleve: EDEleve, decode_html: bool) -> list[Any]:
+        """Get homeworks."""
+        if FAKE_ON:
+            json_resp = await load_json_file(
+                self.test_folder + f"{eleve.eleve_id}_get_homeworks.json"
+            )
+        else:
+            json_resp = await self.ed_client.get_homeworks(eleve_id=eleve.eleve_id)
+            await save_json_file(
+                json_resp,
+                self.log_folder + f"{eleve.eleve_id}_get_homeworks.json",
+            )
+
+        homeworks = []
+        if "data" not in json_resp:
+            LOGGER.warning("get_homeworks: [%s]", json_resp)
+        else:
+            data = json_resp["data"]
+            for key in data.keys():
+                for homework_json in data[key]:
+                    homeworks_by_date_json = await self.get_homeworks_by_date(
+                        eleve, key
+                    )
+                    for matiere in homeworks_by_date_json["matieres"]:
+                        if (
+                            "aFaire" in matiere
+                            and matiere["id"] == homework_json["idDevoir"]
+                        ):
+                            hw = self.get_homework(
+                                matiere, key, decode_html, eleve.eleve_id
+                            )
+                            homeworks.append(hw)
+            if homeworks is not None:
+                homeworks.sort(key=operator.itemgetter("date"))
+
+        return homeworks
+
+    def get_homework(
+        self, data: dict, pour_le: str, clean_content: bool, eleve_id: str
+    ) -> dict:
+        """Get homework information."""
+        a_faire_data = data.get("aFaire")
+        a_faire = a_faire_data if isinstance(a_faire_data, dict) else {}
+        contenu_raw = a_faire.get("contenu")
+        if contenu_raw:
+            try:
+                contenu = base64.b64decode(contenu_raw).decode("utf-8")
+            except Exception:
+                contenu = str(contenu_raw)
+        else:
+            contenu = ""
+        if clean_content:
+            contenu = re.sub(CLEANR, "", contenu)
+        return {
+            "devoir_id": data.get("id"),
+            "eleve_id": eleve_id,
+            "date": datetime.strptime(pour_le, "%Y-%m-%d"),
+            "matiere": data.get("matiere"),
+            "short_description": contenu[0:HOMEWORK_DESC_MAX_LENGTH],
+            "description": contenu,
+            "effectue": a_faire.get("effectue", False),
+            "interrogation": data.get("interrogation", False),
+            "documents": a_faire.get("documents", []),
+        }
+
+    async def post_homework(
+        self, eleve_id: str, devoir_id: int, effectue: bool
+    ) -> bool:
+        """Post homework as done or not done."""
+        response = await self.ed_client.post_homework(
+            eleve_id=eleve_id, devoir_id=devoir_id, effectue=effectue
+        )
+        LOGGER.debug("post_homework response: %s", response)
+        return response["code"] == ED_OK
+
+    async def iter_document(
+        self, file_id: int | str, file_type: str, chunk_size: int = 65536
+    ) -> AsyncIterator[bytes]:
+        """
+        Download a document and yield its content chunk by chunk.
+
+        Despite the library's docstring ("encoded file"), Ecole Directe sends
+        the raw file bytes directly: chunks are forwarded unchanged, which
+        keeps memory usage constant whatever the size of the file.
+        """
+        stream = await self.ed_client.download_file(file_id, file_type)
+        first = True
+        async for chunk in stream.iter_chunked(chunk_size):
+            if first:
+                first = False
+                if chunk.lstrip().startswith(b"{"):
+                    # JSON error message instead of the file
+                    error = (chunk + await stream.read())[:500]
+                    LOGGER.warning("download_file %s error: %s", file_id, error)
+                    msg = f"Ecole Directe refused to send document {file_id}"
+                    raise EDApiClientError(msg)
+            yield chunk
+
+    async def get_grades_evaluations(
+        self,
+        eleve: EDEleve,
+        annee_scolaire: str,
+        grades_display: int = GRADES_TO_DISPLAY,
+    ) -> dict:
+        """Get grades."""
+        if FAKE_ON:
+            json_resp = await load_json_file(
+                self.test_folder + f"{eleve.eleve_id}_get_grades_evaluations.json"
+            )
+        else:
+            json_resp = await self.ed_client.get_grades_evaluations(
+                eleve_id=eleve.eleve_id,
+                annee_scolaire=annee_scolaire,
+            )
+            await save_json_file(
+                json_resp,
+                self.log_folder + f"{eleve.eleve_id}_get_grades_evaluations.json",
+            )
+
+        if "data" not in json_resp:
+            LOGGER.warning("get_grades_evaluations: [%s]", json_resp)
+            return {}
+
+        response = {}
+        response["notes"] = []
+        response["moyenne_generale"] = {}
+        response["evaluations"] = []
+        response["disciplines"] = []
+        data = json_resp["data"]
+        response["periodes"] = get_periodes_moyennes_from_data(data)
+        index1 = 0
+        index2 = 0
+        if "periodes" in data:
+            data["periodes"].sort(key=operator.itemgetter("dateDebut"))
+            for periode_json in data["periodes"]:
+                if periode_json["annuel"] is True:
+                    continue
+                if datetime.now() < datetime.strptime(
+                    periode_json["dateDebut"], "%Y-%m-%d"
+                ):
+                    continue
+                if datetime.now() > datetime.strptime(
+                    periode_json["dateFin"] + " 23:59:59", "%Y-%m-%d %H:%M:%S"
+                ):
+                    continue
+                response["disciplines"] = get_disciplines_periode(periode_json)
+                if "ensembleMatieres" in periode_json:
+                    response["moyenne_generale"] = {
+                        "moyenneGenerale": (
+                            periode_json["ensembleMatieres"].get("moyenneGenerale")
+                            or ""
+                        ).replace(",", "."),
+                        "moyenneClasse": (
+                            periode_json["ensembleMatieres"].get("moyenneClasse") or ""
+                        ).replace(",", "."),
+                        "moyenneMin": (
+                            periode_json["ensembleMatieres"].get("moyenneMin") or ""
+                        ).replace(",", "."),
+                        "moyenneMax": (
+                            periode_json["ensembleMatieres"].get("moyenneMax") or ""
+                        ).replace(",", "."),
+                        "dateCalcul": (
+                            periode_json["ensembleMatieres"].get("dateCalcul") or ""
+                        ),
+                    }
+                break
+
+        if "notes" in data:
+            data["notes"].sort(key=operator.itemgetter("dateSaisie"))
+            data["notes"].reverse()
+            for grade_json in data["notes"]:
+                fallback_matiere = get_lsun_libelle_matiere(
+                    data.get("LSUN"),
+                    grade_json.get("codeMatiere"),
+                    grade_json.get("codePeriode"),
+                )
+                if grade_json["noteSur"] == "0":
+                    index1 += 1
+                    if index1 > grades_display:
+                        continue
+                else:
+                    index2 += 1
+                    if index2 > grades_display:
+                        continue
+                    grade = get_grade(grade_json, fallback_matiere)
+                    response["notes"].append(grade)
+                evaluation = get_evaluation(grade_json, fallback_matiere)
+                if len(evaluation) > 0:
+                    response["evaluations"].append(evaluation)
+        return response
+
+    async def get_vie_scolaire(self, eleve: EDEleve) -> dict:
+        """Get vie scolaire (absences, retards, etc.)."""
+        if FAKE_ON:
+            json_resp = await load_json_file(
+                self.test_folder + f"{eleve.eleve_id}_get_vie_scolaire.json"
+            )
+        else:
+            json_resp = await self.ed_client.get_vie_scolaire(
+                eleve_id=eleve.eleve_id,
+            )
+            await save_json_file(
+                json_resp,
+                self.log_folder + f"{eleve.eleve_id}_get_vie_scolaire.json",
+            )
+
+        if "data" not in json_resp:
+            LOGGER.warning("get_vie_scolaire: [%s]", json_resp)
+            return {}
+
+        response = {}
+        response["absences"] = []
+        response["retards"] = []
+        response["sanctions"] = []
+        response["encouragements"] = []
+        data = json_resp["data"]
+        index1 = 0
+        index2 = 0
+        if "absencesRetards" in data:
+            data["absencesRetards"].sort(key=operator.itemgetter("date"))
+            data["absencesRetards"].reverse()
+            for data_json in data["absencesRetards"]:
+                if data_json["typeElement"] == "Absence":
+                    index1 += 1
+                    if index1 > VIE_SCOLAIRE_TO_DISPLAY:
+                        continue
+                    absence = get_vie_scolaire_element(data_json)
+                    response["absences"].append(absence)
+                else:
+                    index2 += 1
+                    if index2 > VIE_SCOLAIRE_TO_DISPLAY:
+                        continue
+                    retard = get_vie_scolaire_element(data_json)
+                    response["retards"].append(retard)
+
+        index1 = 0
+        index2 = 0
+        if "sanctionsEncouragements" in data:
+            data["sanctionsEncouragements"].sort(key=operator.itemgetter("date"))
+            data["sanctionsEncouragements"].reverse()
+            for data_json in data["sanctionsEncouragements"]:
+                if data_json["typeElement"] == "Punition":
+                    index1 += 1
+                    if index1 > VIE_SCOLAIRE_TO_DISPLAY:
+                        continue
+                    sanction = get_vie_scolaire_element(data_json)
+                    response["sanctions"].append(sanction)
+                else:
+                    index2 += 1
+                    if index2 > VIE_SCOLAIRE_TO_DISPLAY:
+                        continue
+                    encouragement = get_vie_scolaire_element(data_json)
+                    response["encouragements"].append(encouragement)
+
+        return response
+
+    async def get_lessons(
+        self, eleve: EDEleve, date_debut: str, date_fin: str, lunch_break_time: time
+    ) -> list[Any]:
+        """Get lessons."""
+        if FAKE_ON:
+            json_resp = await load_json_file(
+                self.test_folder + f"{eleve.eleve_id}_get_lessons.json"
+            )
+        else:
+            json_resp = await self.ed_client.get_lessons(
+                eleve_id=eleve.eleve_id,
+                date_debut=date_debut,
+                date_fin=date_fin,
+            )
+            await save_json_file(
+                json_resp,
+                self.log_folder + f"{eleve.eleve_id}_get_lessons.json",
+            )
+
+        response = []
+        if "data" not in json_resp:
+            LOGGER.warning("get_lessons: [%s]", json_resp)
+        else:
+            data = json_resp["data"]
+            for lesson_json in data:
+                response.append(get_lesson(lesson_json, lunch_break_time))
+            if response is not None:
+                response.sort(key=operator.itemgetter("start"))
+
+        return response
+
+    async def get_all_wallet_balances(self) -> dict | None:
+        """Get all wallet balances from Ecole Directe."""
+        if FAKE_ON:
+            json_resp = await load_json_file(
+                self.test_folder + "get_all_wallet_balances.json"
+            )
+        else:
+            json_resp = await self.ed_client.get_all_wallet_balances()
+
+        await save_json_file(
+            json_resp,
+            self.log_folder + "get_all_wallet_balances.json",
+        )
+
+        balances = {}
+        if "data" in json_resp and "comptes" in json_resp["data"]:
+            for compte in json_resp["data"]["comptes"]:
+                if compte.get("id"):
+                    compte_id = str(compte["id"])
+                    if compte_id not in balances:
+                        balances[compte_id] = []
+                    balances[compte_id].append(
+                        {
+                            "solde": compte.get("solde"),
+                            "libelle": compte.get("libelle"),
+                        }
+                    )
+            return balances
+
+        LOGGER.warning(
+            "get_all_wallet_balances: No data found in response: [%s]", json_resp
+        )
+        return None
+
+    async def get_sondages(self) -> dict:
+        """Get sondages."""
+        json_resp = await self.ed_client.get_sondages()
+        await save_json_file(
+            json_resp,
+            self.log_folder + "get_sondages.json",
+        )
+        return json_resp
+
+    async def get_workspaces(
+        self, user_id: str | int, account_type: str | int
+    ) -> list[dict[str, Any]]:
+        """Get structured workspaces for an account."""
+        json_resp = await self.ed_client.get_all_espaces_travail(
+            user_id=user_id,
+            account_type=account_type,
+        )
+        await save_json_file(
+            json_resp, self.log_folder + f"{user_id}_get_workspaces.json"
+        )
+        if "data" not in json_resp or not isinstance(json_resp.get("data"), list):
+            LOGGER.warning("get_workspaces: [%s]", json_resp)
+            return []
+
+        data = json_resp["data"]
+        response = []
+        for wk_json in data:
+            if isinstance(wk_json, dict) and wk_json.get("estMembre", False):
+                response.append(get_workspace(wk_json))
+
+        return response
+
+    async def get_workspace_activities(
+        self,
+        workspace_id: str | int,
+        user_id: str | int,
+        account_type: str,
+    ) -> list[EDWorkspaceActivity]:
+        """Get structured activities for a workspace."""
+        response = await self.ed_client.get_activites_espace_travail(
+            espace_id=workspace_id,
+            user_id=user_id,
+            account_type=account_type,
+        )
+        await save_json_file(
+            response,
+            self.log_folder + f"workspace_{workspace_id}_activities.json",
+        )
+        activities = cast("list[EDWorkspaceActivity]", response.get("data", []))
+        for activity in activities:
+            if activity.get("cible") != "CLOUD":
+                continue
+
+            activity_id = (
+                activity.get("date").replace(":", "").replace("-", "").replace(" ", "")
+            )
+            activity_id = activity_id[:-2]
+            if activity_id is None:
+                LOGGER.warning(
+                    "get_workspace_activities: CLOUD activity has no identifier: %s",
+                    activity,
+                )
+                continue
+
+            cloud_response = (
+                await self.ed_client.get_details_cloudactivites_espace_travail(
+                    espace_id=workspace_id,
+                    user_id=activity.get("membre", {}).get("id", user_id),
+                    account_type=activity.get("membre", {}).get("profil", account_type),
+                    activityId=str(activity_id),
+                )
+            )
+            await save_json_file(
+                cloud_response,
+                self.log_folder
+                + f"workspace_{workspace_id}_activity_{activity_id}_cloud_details.json",
+            )
+            activity["cloud_details"] = cloud_response.get("data", {})
+
+        return activities
+
+    async def get_workspace_postits(
+        self, workspace_id: str | int
+    ) -> list[EDWorkspacePostit]:
+        """Get structured post-its for a workspace."""
+        response = await self.ed_client.get_postits(espace_id=workspace_id)
+        await save_json_file(
+            response,
+            self.log_folder + f"workspace_{workspace_id}_postits.json",
+        )
+        postits = cast("list[EDWorkspacePostit]", response.get("data", []))
+        for postit in postits:
+            if "contenu" in postit and isinstance(postit["contenu"], str):
+                with suppress(Exception):
+                    postit["contenu"] = base64.b64decode(postit["contenu"]).decode(
+                        "utf-8"
+                    )
+        return postits
+
+    async def get_formulaires(
+        self, annee_forms: str, account_type: str, id_entity: str
+    ) -> list[Any]:
+        """Get formulaires."""
+        json_resp = await self.ed_client.get_formulaires(
+            annee_forms, account_type=account_type, id_entity=id_entity
+        )
+        await save_json_file(
+            json_resp,
+            self.log_folder + f"{id_entity}_get_formulaires.json",
+        )
+
+        response = []
+        if "data" not in json_resp:
+            LOGGER.warning("get_formulaires: [%s]", json_resp)
+        else:
+            data = json_resp["data"]
+            for form_json in data:
+                response.append(get_formulaire(form_json))
+
+        return response
+
+    async def get_classe(self, classe_id: str) -> None:
+        """Get classe."""
+        await self.ed_client.get_classe(classe_id=classe_id)
+
+
+def get_periodes_moyennes_from_data(data: dict) -> list[dict]:
+    """Récupère l'ensemble des périodes avec leurs moyennes générales."""
+    periodes_result = []
+    # Trier les périodes par date de début
+    periodes = sorted(data.get("periodes", []), key=operator.itemgetter("dateDebut"))
+
+    for periode_json in periodes:
+        # On extrait les infos de base de la période
+        periode_info = {
+            "idPeriode": periode_json.get("idPeriode"),
+            "codePeriode": periode_json.get("codePeriode"),
+            "nomPeriode": periode_json.get("periode"),
+            "annuel": periode_json.get("annuel", False),
+            "examenBlanc": periode_json.get("examenBlanc", False),
+            "cloture": periode_json.get("cloture", False),
+            "dateDebut": periode_json.get("dateDebut"),
+            "dateFin": periode_json.get("dateFin"),
+            "moyenne_generale": {},
+        }
+        # Extraire la moyenne générale de la période
+        ensemble = periode_json.get("ensembleMatieres", {})
+        if ensemble:
+            periode_info["moyenne_generale"] = {
+                "moyenneGenerale": (ensemble.get("moyenneGenerale") or "").replace(
+                    ",", "."
+                ),
+                "moyenneClasse": (ensemble.get("moyenneClasse") or "").replace(
+                    ",", "."
+                ),
+                "moyenneMin": (ensemble.get("moyenneMin") or "").replace(",", "."),
+                "moyenneMax": (ensemble.get("moyenneMax") or "").replace(",", "."),
+                "dateCalcul": ensemble.get("dateCalcul", ""),
+            }
+        periodes_result.append(periode_info)
+    return periodes_result
+
+
+async def load_json_file(file_path: str) -> dict:
+    """Load JSON file."""
+    async with await anyio.open_file(file_path, "r") as f:
+        return json.loads(await f.read())
+
+
+async def save_json_file(json_content: Any, file_path: str) -> None:
+    """Save JSON file."""
+    async with await anyio.open_file(file_path, "w", encoding="utf-8") as f:
+        await f.write(json.dumps(json_content, indent=4, ensure_ascii=False))
+
+
+async def check_ecoledirecte_session(user: str, pwd: str, hass: HomeAssistant) -> bool:
+    """Check if credentials to Ecole Directe are ok."""
+    try:
+        async with EDApiClient(user, pwd, hass=hass) as client:
+            await client.login()
+    except QCMException:
+        return True
+    return client is not None
+
+
+def get_lsun_libelle_matiere(
+    lsun: Any | None,
+    code_matiere: str | None,
+    code_periode: str | None,
+) -> str | None:
+    """Find the matching libelleMatiere in LSUN by codeMatiere and codePeriode."""
+    if not code_matiere or not isinstance(lsun, dict):
+        return None
+
+    if code_periode and code_periode in lsun:
+        period_items = lsun.get(code_periode)
+        if isinstance(period_items, list):
+            for item in period_items:
+                if (
+                    isinstance(item, dict)
+                    and item.get("codeMatiere") == code_matiere
+                    and item.get("libelleMatiere")
+                ):
+                    return item["libelleMatiere"]
+
+    for period_items in lsun.values():
+        if not isinstance(period_items, list):
+            continue
+        for item in period_items:
+            if (
+                isinstance(item, dict)
+                and item.get("codeMatiere") == code_matiere
+                and item.get("libelleMatiere")
+            ):
+                return item["libelleMatiere"]
+
+    return None
+
+
+def get_matiere(data: Any, fallback_matiere: str | None = None) -> str | None:
+    """Get the correct matiere label from grade/evaluation data."""
+    if data.get("codeSousMatiere") and fallback_matiere:
+        return f"{fallback_matiere} - {data.get('libelleMatiere')}"
+    return data.get("libelleMatiere")
+
+
+def get_grade(data: Any, fallback_matiere: str | None = None) -> dict:
+    """Get grade information."""
+    elements_programme = []
+    if "elementsProgramme" in data:
+        for element in data["elementsProgramme"]:
+            elements_programme.append(get_competence(element))
+
+    return {
+        "date": data.get("date"),
+        "matiere": get_matiere(data, fallback_matiere),
+        "commentaire": data.get("devoir"),
+        "note": data.get("valeur"),
+        "sur": data.get("noteSur").replace(".", ","),
+        "note_sur": data.get("valeur") + "/" + data.get("noteSur"),
+        "coefficient": (data.get("coef") or "").replace(".", ","),
+        "moyenne_classe": (data.get("moyenneClasse") or "").replace(".", ","),
+        "max": str(data.get("maxClasse") or "").replace(".", ","),
+        "min": str(data.get("minClasse") or "").replace(".", ","),
+        "non_significatif": data.get("nonSignificatif"),
+        "date_saisie": data.get("dateSaisie"),
+        "elements_programme": elements_programme,
+    }
+
+
+def get_disciplines_periode(data: Any) -> list:
+    """Get periode information."""
+    disciplines = []
+    try:
+        if "ensembleMatieres" in data and "disciplines" in data["ensembleMatieres"]:
+            for discipline_json in data["ensembleMatieres"]["disciplines"]:
+                if (
+                    "codeSousMatiere" in discipline_json
+                    and len(discipline_json["codeSousMatiere"]) > 0
+                ):
+                    continue
+                if (
+                    "groupeMatiere" in discipline_json
+                    and discipline_json["groupeMatiere"] is True
+                ):
+                    continue
+                discipline = {
+                    "code": discipline_json.get("codeMatiere", "").lower(),
+                    "nom": discipline_json.get("discipline", "").lower(),
+                    "moyenne": discipline_json.get("moyenne", "").replace(",", "."),
+                    "moyenneClasse": discipline_json.get("moyenneClasse", "").replace(
+                        ",", "."
+                    ),
+                    "moyenneMin": discipline_json.get("moyenneMin", "").replace(
+                        ",", "."
+                    ),
+                    "moyenneMax": discipline_json.get("moyenneMax", "").replace(
+                        ",", "."
+                    ),
+                    "appreciations": discipline_json.get("appreciations", ""),
+                }
+                disciplines.append(discipline)
+    except Exception:
+        LOGGER.exception("get_periode: %s", data)
+        raise
+    return disciplines
+
+
+LEVEL_MAPPING: dict[str, str] = {
+    "1": "Non atteint",
+    "2": "Partiellement atteint",
+    "3": "Atteint",
+    "4": "Dépassé",
+    "-1": "Absent",
+    "-2": "Dispensé",
+    "-3": "Non évalué",
+}
+
+
+def get_level(valeur: str | None) -> str:
+    """Retourne le niveau sous forme de texte selon la valeur."""
+    if valeur is None:
+        return "Inconnu"
+    return LEVEL_MAPPING.get(str(valeur), "Inconnu")
+
+
+def get_evaluation(data: Any, fallback_matiere: str | None = None) -> dict:
+    """Get evaluation information."""
+    try:
+        elements_programme = []
+        if "elementsProgramme" in data:
+            for element in data["elementsProgramme"]:
+                elements_programme.append(element)
+
+        if len(elements_programme) == 0:
+            return {}
+
+        return {
+            "devoir": data.get("devoir"),
+            "date": data.get("date"),
+            "date_saisie": data.get("dateSaisie"),
+            "matiere": get_matiere(data, fallback_matiere),
+            "elements_programme": [
+                {
+                    "competence": competence.get("libelleCompetence"),
+                    "descriptif": competence.get("descriptif"),
+                    "valeur": competence.get("valeur"),
+                    "level": get_level(competence.get("valeur")),
+                }
+                for competence in elements_programme
+            ],
+        }
+    except Exception:
+        LOGGER.exception("get_evaluation: %s", data)
+        raise
+
+
+def get_competence(data: Any) -> dict:
+    """Get grade information."""
+    return {
+        "competence": data.get("libelleCompetence"),
+        "descriptif": data.get("descriptif"),
+        "valeur": data.get("valeur"),
+        "level": get_level(data.get("valeur")),
+    }
+
+
+def get_vie_scolaire_element(viescolaire: Any) -> dict:
+    """Vie scolaire format."""
+    try:
+        return {
+            "date": viescolaire["date"],
+            "type_element": viescolaire["typeElement"],
+            "display_date": viescolaire["displayDate"],
+            "justifie": viescolaire["justifie"],
+            "motif": viescolaire["motif"],
+            "libelle": viescolaire["libelle"],
+            "commentaire": viescolaire["commentaire"],
+        }
+    except Exception:
+        LOGGER.exception("Error on format_viescolaire: %s", viescolaire)
+        return {}
+
+
+def get_lesson(data: Any, lunch_break_time: time) -> dict:
+    """Get lesson information."""
+    start_date = datetime.strptime(data["start_date"], "%Y-%m-%d %H:%M")
+    end_date = datetime.strptime(data["end_date"], "%Y-%m-%d %H:%M")
+    return {
+        "id": data["id"],
+        "start": start_date,
+        "end": end_date,
+        "start_at": start_date.strftime("%Y-%m-%d %H:%M"),
+        "end_at": end_date.strftime("%Y-%m-%d %H:%M"),
+        "start_time": start_date.strftime("%H:%M"),
+        "end_time": end_date.strftime("%H:%M"),
+        "lesson": data["text"],
+        "salle": data["salle"],
+        "groupe_id": data["groupeId"],
+        "is_annule": data["isAnnule"],
+        "is_modifie": data["isModifie"],
+        "background_color": data["color"],
+        "prof": data["prof"],
+        "dispense": data["dispense"],
+        "is_morning": start_date.time() < lunch_break_time,
+        "is_afternoon": start_date.time() >= lunch_break_time,
+    }
+
+
+def get_formulaire(data: Any) -> dict:
+    """Get formulaire."""
+    return {
+        "titre": data["titre"],
+        "created": data["created"],
+    }
+
+
+def get_workspace(data: Any) -> dict[str, Any]:
+    """Get workspace information."""
+    if not isinstance(data, dict):
+        return {}
+
+    contenu = ""
+    resume_raw = data.get("resume")
+    if resume_raw:
+        try:
+            contenu = base64.b64decode(resume_raw).decode("utf-8")
+        except Exception:
+            contenu = str(resume_raw)
+
+    return {
+        "agenda": data.get("agenda"),
+        "cloud": data.get("cloud"),
+        "creeLe": data.get("creeLe"),
+        "creePar": data.get("creePar"),
+        "estMembre": data.get("estMembre"),
+        "id": data.get("id"),
+        "ouvert": data.get("ouvert"),
+        "public": data.get("public"),
+        "resume": contenu,
+        "titre": data.get("titre"),
+        "type": data.get("type"),
+    }

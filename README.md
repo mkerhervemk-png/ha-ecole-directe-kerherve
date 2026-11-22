@@ -1,4 +1,4 @@
-# École Directe — version Kerherve (1.3.0.1)
+# École Directe — version Kerherve (1.3.0.2)
 
 Base : intégration officielle hacf-fr/hass-ecoledirecte v1.3.0 (licence MIT),
 connexion et capteurs d'origine inchangés. Ajouts ci-dessous.
@@ -37,12 +37,14 @@ Sondages, Dernière mise à jour (avec la liste des rubriques en erreur ou coup�
 - Les rubriques du site sont relues un cycle sur 4 (toutes les 2 h avec le réglage par défaut).
 - Une rubrique refusée 3 fois de suite n'est plus demandée jusqu'au redémarrage.
 - Un capteur de rubrique n'est créé que si l'école fournit cette rubrique.
+- Actions : `ecole_directe.reload_data` actualise tout de suite tous les comptes ;
+  `ecole_directe.devoir_effectue` s'applique au compte qui contient l'élève indiqué.
 
 ## Fichiers ajoutés ou modifiés
 Ajoutés : `api/extras.py`, `coordinator/extras.py`, `sensor/extras.py`,
 `entity_utils/planning.py`, `binary_sensor.py`.
 Modifiés (quelques lignes) : `coordinator/base.py`, `sensor/__init__.py`, `__init__.py`,
-`const.py`, `manifest.json`.
+`const.py`, `manifest.json`, `service_actions/__init__.py`, traductions.
 
 ## Retour arrière
 Retirer ce dépôt de HACS, réinstaller « Ecole Directe » officielle, redémarrer.

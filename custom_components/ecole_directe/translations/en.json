@@ -35,5 +35,40 @@
                 }
             }
         }
+    },
+    "exceptions": {
+        "authentication_failed": {
+            "message": "École Directe rejected the username or password."
+        },
+        "update_failed": {
+            "message": "Unable to fetch data from École Directe."
+        },
+        "no_loaded_entry": {
+            "message": "No École Directe account is loaded."
+        }
+    },
+    "services": {
+        "devoir_effectue": {
+            "name": "Mark homework as done",
+            "description": "Ticks or unticks a homework item on École Directe.",
+            "fields": {
+                "eleve_id": {
+                    "name": "Pupil ID",
+                    "description": "École Directe ID of the pupil."
+                },
+                "devoir_id": {
+                    "name": "Homework ID",
+                    "description": "ID of the homework (attribute of the homework sensors)."
+                },
+                "effectue": {
+                    "name": "Done",
+                    "description": "On = done, off = to do."
+                }
+            }
+        },
+        "reload_data": {
+            "name": "Refresh data",
+            "description": "Polls École Directe right now for every account."
+        }
     }
 }

@@ -8,7 +8,9 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import probatio as vol
-from homeassistant.core import ServiceCall, SupportsResponse, callback
+from homeassistant.config_entries import ConfigEntryState
+from homeassistant.core import ServiceCall, SupportsResponse
+from homeassistant.exceptions import ServiceValidationError
 from homeassistant.helpers import config_validation as cv
 
 from custom_components.ecole_directe.const import (
@@ -24,6 +26,7 @@ if TYPE_CHECKING:
 
 # Service action names - only used within service_actions module
 SERVICE_DEVOIR_EFFECTUE = "devoir_effectue"
+SERVICE_RELOAD_DATA = "reload_data"
 
 
 async def async_setup_services(hass: HomeAssistant) -> None:
@@ -39,16 +42,45 @@ async def async_setup_services(hass: HomeAssistant) -> None:
     Service handlers iterate over all config entries to find the relevant one.
     """
 
-    @callback
+    def _loaded_entries() -> list:
+        entries = [
+            entry
+            for entry in hass.config_entries.async_entries(DOMAIN)
+            if entry.state is ConfigEntryState.LOADED
+        ]
+        if not entries:
+            raise ServiceValidationError(
+                translation_domain=DOMAIN, translation_key="no_loaded_entry"
+            )
+        return entries
+
     async def handle_devoir_effectue(call: ServiceCall) -> None:
         """Handle the service action call."""
-        # Find all config entries for this domain
-        entries = hass.config_entries.async_entries(DOMAIN)
-        if not entries:
-            LOGGER.warning("No config entries found for %s", DOMAIN)
-        # Use first entry (or implement logic to select specific entry)
-        entry = entries[0]
+        # Pick the account that owns this pupil (several accounts can be set up).
+        entries = _loaded_entries()
+        eleve_id = str(call.data["eleve_id"])
+        entry = next(
+            (
+                e
+                for e in entries
+                if any(
+                    str(getattr(eleve, "eleve_id", "")) == eleve_id
+                    for eleve in getattr(
+                        (e.runtime_data.coordinator.data or {}).get("session"),
+                        "eleves",
+                        [],
+                    )
+                    or []
+                )
+            ),
+            entries[0],
+        )
         await async_handle_devoir_effectue(hass, entry, call)
+
+    async def handle_reload_data(call: ServiceCall) -> None:
+        """Refresh every loaded account now."""
+        for entry in _loaded_entries():
+            await entry.runtime_data.coordinator.async_request_refresh()
 
     # Register services (only once at component level)
     if not hass.services.has_service(DOMAIN, SERVICE_DEVOIR_EFFECTUE):
@@ -63,6 +95,15 @@ async def async_setup_services(hass: HomeAssistant) -> None:
                     vol.Optional("effectue", default=True): cv.boolean,
                 }
             ),
+            supports_response=SupportsResponse.NONE,
+        )
+
+    if not hass.services.has_service(DOMAIN, SERVICE_RELOAD_DATA):
+        hass.services.async_register(
+            domain=DOMAIN,
+            service=SERVICE_RELOAD_DATA,
+            service_func=handle_reload_data,
+            schema=vol.Schema({}),
             supports_response=SupportsResponse.NONE,
         )
 

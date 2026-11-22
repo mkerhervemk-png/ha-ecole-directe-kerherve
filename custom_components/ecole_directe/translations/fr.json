@@ -35,5 +35,40 @@
                 }
             }
         }
+    },
+    "exceptions": {
+        "authentication_failed": {
+            "message": "École Directe a refusé l'identifiant ou le mot de passe."
+        },
+        "update_failed": {
+            "message": "Impossible de récupérer les données d'École Directe."
+        },
+        "no_loaded_entry": {
+            "message": "Aucun compte École Directe n'est chargé."
+        }
+    },
+    "services": {
+        "devoir_effectue": {
+            "name": "Marquer un devoir comme fait",
+            "description": "Coche ou décoche un devoir sur École Directe.",
+            "fields": {
+                "eleve_id": {
+                    "name": "Identifiant de l'élève",
+                    "description": "Identifiant École Directe de l'élève."
+                },
+                "devoir_id": {
+                    "name": "Identifiant du devoir",
+                    "description": "Identifiant du devoir (attribut des capteurs de devoirs)."
+                },
+                "effectue": {
+                    "name": "Fait",
+                    "description": "Coché = devoir fait, décoché = à faire."
+                }
+            }
+        },
+        "reload_data": {
+            "name": "Actualiser les données",
+            "description": "Interroge École Directe immédiatement pour tous les comptes."
+        }
     }
 }

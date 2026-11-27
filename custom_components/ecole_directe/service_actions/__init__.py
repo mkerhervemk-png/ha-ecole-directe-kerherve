@@ -8,7 +8,9 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import probatio as vol
+from homeassistant.config_entries import ConfigEntryState
 from homeassistant.core import ServiceCall, SupportsResponse, callback
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import config_validation as cv
 
 from custom_components.ecole_directe.const import (
@@ -22,8 +24,32 @@ from custom_components.ecole_directe.service_actions.service import (
 if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
 
+    from custom_components.ecole_directe.data import EDConfigEntry
+
 # Service action names - only used within service_actions module
 SERVICE_DEVOIR_EFFECTUE = "devoir_effectue"
+
+
+def _choisir_entree(hass: HomeAssistant, entry_id: str | None) -> EDConfigEntry:
+    """Choisit explicitement le compte ciblé ; aucune écriture si le choix est ambigu."""
+    entries = hass.config_entries.async_entries(DOMAIN)
+    if not entries:
+        msg = "Aucun compte École Directe configuré"
+        raise HomeAssistantError(msg)
+    if entry_id is None:
+        if len(entries) > 1:
+            msg = "Plusieurs comptes configurés : préciser config_entry_id"
+            raise HomeAssistantError(msg)
+        entry = entries[0]
+    else:
+        entry = hass.config_entries.async_get_entry(entry_id)
+        if entry is None or entry.domain != DOMAIN:
+            msg = f"Compte École Directe inconnu : {entry_id}"
+            raise HomeAssistantError(msg)
+    if entry.state is not ConfigEntryState.LOADED or getattr(entry, "runtime_data", None) is None:
+        msg = "Compte École Directe non chargé"
+        raise HomeAssistantError(msg)
+    return entry
 
 
 async def async_setup_services(hass: HomeAssistant) -> None:
@@ -42,12 +68,7 @@ async def async_setup_services(hass: HomeAssistant) -> None:
     @callback
     async def handle_devoir_effectue(call: ServiceCall) -> None:
         """Handle the service action call."""
-        # Find all config entries for this domain
-        entries = hass.config_entries.async_entries(DOMAIN)
-        if not entries:
-            LOGGER.warning("No config entries found for %s", DOMAIN)
-        # Use first entry (or implement logic to select specific entry)
-        entry = entries[0]
+        entry = _choisir_entree(hass, call.data.get("config_entry_id"))
         await async_handle_devoir_effectue(hass, entry, call)
 
     # Register services (only once at component level)
@@ -61,6 +82,7 @@ async def async_setup_services(hass: HomeAssistant) -> None:
                     vol.Required("eleve_id"): vol.Coerce(int),
                     vol.Required("devoir_id"): vol.Coerce(int),
                     vol.Optional("effectue", default=True): cv.boolean,
+                    vol.Optional("config_entry_id"): cv.string,
                 }
             ),
             supports_response=SupportsResponse.NONE,

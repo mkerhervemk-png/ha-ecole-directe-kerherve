@@ -26,6 +26,11 @@ devoir_effectue:
       example: "2021"
       # The default field value
       default: "0"
+    config_entry_id:
+      # Obligatoire seulement si plusieurs comptes École Directe sont configurés
+      required: false
+      advanced: false
+      example: "01JEXEMPLEENTRYID"
     effectue:
       # Whether or not field is required (default = false)
       required: true

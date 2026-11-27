@@ -38,7 +38,10 @@ async def async_handle_devoir_effectue(
             eleve = next(
                 (e for e in client.eleves if e.eleve_id == str(eleve_id)), None
             )
-            if eleve is not None and eleve.account_id_login is not None:
+            if eleve is None:
+                msg = f"Élève {eleve_id} absent du compte authentifié : aucune écriture"
+                raise HomeAssistantError(msg)
+            if eleve.account_id_login is not None:
                 await client.switch_account(eleve.account_id_login)
             done = await client.post_homework(
                 eleve_id=eleve_id, devoir_id=devoir_id, effectue=effectue
